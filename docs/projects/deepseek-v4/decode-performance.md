@@ -40,6 +40,7 @@ target/release/bench_serving \
 | Clean sub-30 repeat after trace cleanup | `29.944ms`, `29.907ms`, `29.896ms` | Same fixed bench after removing per-layer trace syncs; all three measured iterations keep token hash `6346f03343d75a65`. |
 | Fused MoE mapping clear | `29.862ms`, `29.969ms`, `29.874ms` | Merge six local-route mapping clear launches into one kernel; exact E2E `20/20`, token hash stays `6346f03343d75a65`. |
 | Small-route MoE mapping | first run `27.608ms`, `27.662ms`, `27.826ms`; repeat `27.698ms`, `27.693ms`, `27.644ms` | Decode route mapping uses one small-batch kernel for `route_elems <= 1024`; exact E2E `20/20`, token hash stays `6346f03343d75a65`. |
+| Current retained calibration | `28.940ms`, `28.942ms`, `28.913ms` | Same retained runtime after tool/doc-only commits and 5090 resync; still stable sub-30 with hash `6346f03343d75a65`, but not a new best. |
 
 Final PR validation on 5090:
 
@@ -767,6 +768,42 @@ A narrower per-layer trace at the same hard-coded `start_pos == 80` logged `43 l
 
 The largest single layer/request cross-rank ranges were `0.448ms` in layer `1` attention collective, `0.375ms` in layer `19` attention local, and `0.363ms` in layer `19` attention collective. There was no repeated multi-millisecond rank outlier in this per-layer view. That changes the next bet: stable sub-`30ms/token` is less likely to come from only rank-affinity or one MoE scalar cleanup, and more likely from reducing the largest absolute sections, namely attention local (`~17ms`) and MoE (`~15ms`), while keeping launch count and synchronization windows low.
 
+A later short full-process nsys run on the current retained code used:
+
+```bash
+nsys profile --force-overwrite=true -t cuda,nvtx \
+  -o /tmp/dsv4_current_short \
+  target/release/bench_serving \
+    --model-path /data/DeepSeek-V4-Flash \
+    --format json \
+    request \
+    --prompt-len 1 \
+    --output-len 32 \
+    --warmup 1 \
+    --iters 1 \
+    --seed 42
+```
+
+The profile is attribution-only, but it confirms why the last MoE microbench wins did not become full-runtime wins:
+
+| Kernel bucket | Total GPU time | Share | Notes |
+| --- | ---: | ---: | --- |
+| f32 all-reduce, wait-inclusive | `2.690s` | `20.59%` | NCCL wall includes rank-arrival wait; do not read as pure transfer. |
+| Dense GEMM/GEMV other | `2.199s` | `16.83%` | Mostly non-MoE dense/HC/attention small GEMM/GEMV work. |
+| HC scaffold/norm | `1.598s` | `12.23%` | HC pre/post/norm/Hadamard-style kernels remain launch-heavy. |
+| f32 reduce-scatter, wait-inclusive | `1.399s` | `10.71%` | MoE RS window, also wait-inclusive. |
+| Attention local | `1.009s` | `7.72%` | Compressor/indexer/sparse-attention local pieces. |
+| Routed W13 grouped FP4 | `0.949s` | `7.26%` | Main routed expert local GEMM. |
+| BF16 all-gather, wait-inclusive | `0.630s` | `4.82%` | MoE AG window, wait-inclusive. |
+| Routed W2 grouped FP4 | `0.531s` | `4.06%` | Main routed down projection. |
+| Shared W13 FP8 | `0.432s` | `3.31%` | Shared expert front half. |
+| Router | `0.335s` | `2.56%` | Gate score/select/normalize. |
+| Shared W2 FP8 | `0.252s` | `1.93%` | Shared expert down projection. |
+| Routed mapping/expand/reduce | `0.128s` | `0.98%` | Small-route mapping is no longer a large section. |
+| Routed SwiGLU+quant | `0.083s` | `0.64%` | Explains why accumulator-direct scalar epilogue cannot close the sub-25 gap alone. |
+
+Interpretation: after the retained W13/SwiGLU/W2 path, the next real sub-25 work should not be another standalone activation/quant kernel swap. Either change the actual W13/W2 grouped GEMM scheduler/epilogue, or move to the larger attention/HC/dense-GEMV sections. NCCL rows stay wait-inclusive and should be paired with rank-arrival evidence before optimizing collectives.
+
 ### NCCL wall is wait-inclusive
 
 Nsight Systems NCCL kernel wall time includes rank-arrival waiting. Treat NCCL rows as synchronization-window evidence unless rank-arrival skew and post-arrival tail have been separated. The rank-affinity work was selected because corrected f32 all-reduce grouping showed attention hidden all-reduce dominated by arrival skew, not post-arrival NCCL tail.
@@ -841,6 +878,8 @@ Local:
 - rejected grouped GEMM row-tile upper-bound fixed bench log `/tmp/dsv4_max_expert_rows_bench.log`: per-iteration steady TPOT avg `28.504ms`, `28.460ms`, `28.735ms`; all hash `6346f03343d75a65`
 - active-expert W13/W2 compact-pointer microbench on 5090: `/tmp/w13_grouped_fp4_bench --experts 32 --active-experts {1,3,6} --rows-per-active 8`; bitwise PASS, W13 compact speedup `0.999x`, `1.009x`, `1.000x`, W2 compact speedup `1.000x`, `1.000x`, `1.000x`
 - accumulator-direct SwiGLU quant upper-bound microbench on 5090: `/tmp/swiglu_quant_bench --rows {48,96,192}`; bitwise PASS, materialized/direct deltas `0.002255ms`, `0.000589ms`, `0.002048ms`
+- current retained fixed bench log `/tmp/dsv4_current_retained_bench.log`: per-iteration steady TPOT avg `28.940ms`, `28.942ms`, `28.913ms`; all hash `6346f03343d75a65`
+- current retained short profile `/tmp/dsv4_current_short.nsys-rep` and kernel summary `/tmp/dsv4_current_short_kernels_cuda_gpu_kern_sum.csv`: routed SwiGLU+quant only `0.64%`, routed W13/W2 grouped FP4 together `11.32%`, and wait-inclusive NCCL rows remain the largest apparent rows.
 - `gcc -shared -fPIC -O2 -Wall -Wextra -o /tmp/cuda_api_counter.so tools/cuda_api_counter.c -ldl`
 - `nm -D /tmp/cuda_api_counter.so` confirmed base and `_ptsz` wrappers
 
