@@ -29,6 +29,24 @@ extern "C" int deepseek_tilelang_fp4_grouped_gemm_n2048_k4096(
     int local_experts,
     cudaStream_t stream);
 
+extern "C" int deepseek_tilelang_act_quant_k2048(
+    const void* x,
+    void* y,
+    void* scales,
+    int m,
+    cudaStream_t stream);
+
+extern "C" int deepseek_tilelang_fp4_grouped_gemm_n4096_k2048(
+    const void* a,
+    const void* const* b,
+    void* c,
+    const void* scales_a,
+    const void* const* scales_b,
+    const int* expert_indptr,
+    int m,
+    int local_experts,
+    cudaStream_t stream);
+
 extern "C" int deepseek_tilelang_fp4_grouped_w13_gemm_n2048_k4096(
     const void* a,
     const void* const* w1,
@@ -49,6 +67,10 @@ constexpr int kInDim = 4096;
 constexpr int kOutDim = 2048;
 constexpr int kActScaleCols = kInDim / 128;
 constexpr int kWeightScaleCols = kInDim / 32;
+constexpr int kW2InDim = 2048;
+constexpr int kW2OutDim = 4096;
+constexpr int kW2ActScaleCols = kW2InDim / 128;
+constexpr int kW2WeightScaleCols = kW2InDim / 32;
 
 #define CUDA_CHECK(expr)                                                       \
   do {                                                                         \
@@ -236,6 +258,13 @@ int main(int argc, char** argv) {
   const size_t weight_bytes_per_expert = static_cast<size_t>(kOutDim) * kInDim / 2;
   const size_t weight_scale_bytes_per_expert = static_cast<size_t>(kOutDim) * kWeightScaleCols;
   const size_t out_elems = static_cast<size_t>(args.rows) * kOutDim;
+  const size_t w2_x_elems = static_cast<size_t>(args.rows) * kW2InDim;
+  const size_t w2_act_bytes = w2_x_elems;
+  const size_t w2_act_scale_bytes = static_cast<size_t>(args.rows) * kW2ActScaleCols;
+  const size_t w2_weight_bytes_per_expert = static_cast<size_t>(kW2OutDim) * kW2InDim / 2;
+  const size_t w2_weight_scale_bytes_per_expert =
+      static_cast<size_t>(kW2OutDim) * kW2WeightScaleCols;
+  const size_t w2_out_elems = static_cast<size_t>(args.rows) * kW2OutDim;
 
   std::vector<__nv_bfloat16> x_host(x_elems);
   for (auto& value : x_host) {
@@ -273,6 +302,19 @@ int main(int argc, char** argv) {
   fill_ptrs(s1, weight_scale_bytes_per_expert, args.experts, &s1_ptrs);
   fill_ptrs(s3, weight_scale_bytes_per_expert, args.experts, &s3_ptrs);
 
+  const size_t all_w2_weight_bytes = w2_weight_bytes_per_expert * args.experts;
+  const size_t all_w2_scale_bytes = w2_weight_scale_bytes_per_expert * args.experts;
+  std::vector<unsigned char> w2_host(all_w2_weight_bytes);
+  std::vector<unsigned char> s2_host(all_w2_scale_bytes);
+  for (auto& value : w2_host) value = static_cast<unsigned char>(byte_dist(rng));
+  for (auto& value : s2_host) value = static_cast<unsigned char>(scale_dist(rng));
+  auto* w2 = device_copy(w2_host);
+  auto* s2 = device_copy(s2_host);
+  void** w2_ptrs = nullptr;
+  void** s2_ptrs = nullptr;
+  fill_ptrs(w2, w2_weight_bytes_per_expert, args.experts, &w2_ptrs);
+  fill_ptrs(s2, w2_weight_scale_bytes_per_expert, args.experts, &s2_ptrs);
+
   const bool active_mode = args.active_experts > 0;
   std::vector<int> indptr_host = active_mode
       ? make_active_prefix_full_indptr(args.experts, args.active_experts, args.rows_per_active)
@@ -282,6 +324,8 @@ int main(int argc, char** argv) {
   void** w3_compact_ptrs = nullptr;
   void** s1_compact_ptrs = nullptr;
   void** s3_compact_ptrs = nullptr;
+  void** w2_compact_ptrs = nullptr;
+  void** s2_compact_ptrs = nullptr;
   int* compact_indptr = nullptr;
   std::vector<int> compact_indptr_host;
   if (active_mode) {
@@ -289,6 +333,8 @@ int main(int argc, char** argv) {
     fill_ptrs(w3, weight_bytes_per_expert, args.active_experts, &w3_compact_ptrs);
     fill_ptrs(s1, weight_scale_bytes_per_expert, args.active_experts, &s1_compact_ptrs);
     fill_ptrs(s3, weight_scale_bytes_per_expert, args.active_experts, &s3_compact_ptrs);
+    fill_ptrs(w2, w2_weight_bytes_per_expert, args.active_experts, &w2_compact_ptrs);
+    fill_ptrs(s2, w2_weight_scale_bytes_per_expert, args.active_experts, &s2_compact_ptrs);
     compact_indptr_host = make_active_prefix_indptr(args.active_experts, args.rows_per_active);
     compact_indptr = device_copy(compact_indptr_host);
   }
@@ -340,9 +386,44 @@ int main(int argc, char** argv) {
         args.active_experts, stream));
   };
 
+  __nv_bfloat16* w2_x = nullptr;
+  unsigned char* w2_act = nullptr;
+  unsigned char* w2_act_scale = nullptr;
+  __nv_bfloat16* w2_capacity = nullptr;
+  __nv_bfloat16* w2_compact = nullptr;
+  if (active_mode) {
+    std::vector<__nv_bfloat16> w2_x_host(w2_x_elems);
+    for (auto& value : w2_x_host) {
+      value = __float2bfloat16(x_dist(rng));
+    }
+    w2_x = device_copy(w2_x_host);
+    CUDA_CHECK(cudaMalloc(&w2_act, w2_act_bytes));
+    CUDA_CHECK(cudaMalloc(&w2_act_scale, w2_act_scale_bytes));
+    CUDA_CHECK(cudaMalloc(&w2_capacity, w2_out_elems * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&w2_compact, w2_out_elems * sizeof(__nv_bfloat16)));
+    TK_CHECK(deepseek_tilelang_act_quant_k2048(w2_x, w2_act, w2_act_scale, args.rows, stream));
+    CUDA_CHECK(cudaMemsetAsync(w2_capacity, 0x77, w2_out_elems * sizeof(__nv_bfloat16), stream));
+    CUDA_CHECK(cudaMemsetAsync(w2_compact, 0x88, w2_out_elems * sizeof(__nv_bfloat16), stream));
+  }
+  auto run_w2_capacity = [&]() {
+    TK_CHECK(deepseek_tilelang_fp4_grouped_gemm_n4096_k2048(
+        w2_act, reinterpret_cast<const void* const*>(w2_ptrs), w2_capacity, w2_act_scale,
+        reinterpret_cast<const void* const*>(s2_ptrs), indptr, args.rows, args.experts, stream));
+  };
+  auto run_w2_compact = [&]() {
+    TK_CHECK(deepseek_tilelang_fp4_grouped_gemm_n4096_k2048(
+        w2_act, reinterpret_cast<const void* const*>(w2_compact_ptrs), w2_compact, w2_act_scale,
+        reinterpret_cast<const void* const*>(s2_compact_ptrs), compact_indptr, args.rows,
+        args.active_experts, stream));
+  };
+
   run_baseline();
   run_w13();
   if (active_mode) run_w13_compact();
+  if (active_mode) {
+    run_w2_capacity();
+    run_w2_compact();
+  }
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   std::vector<uint16_t> gate_ref_host(out_elems);
@@ -359,12 +440,19 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(gate_compact_host.data(), gate_compact, out_elems * sizeof(uint16_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(up_compact_host.data(), up_compact, out_elems * sizeof(uint16_t), cudaMemcpyDeviceToHost));
   }
+  std::vector<uint16_t> w2_capacity_host(w2_out_elems);
+  std::vector<uint16_t> w2_compact_host(w2_out_elems);
+  if (active_mode) {
+    CUDA_CHECK(cudaMemcpy(w2_capacity_host.data(), w2_capacity, w2_out_elems * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(w2_compact_host.data(), w2_compact, w2_out_elems * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+  }
 
   int gate_mismatches = compare_u16(gate_ref_host, gate_w13_host, "gate");
   int up_mismatches = compare_u16(up_ref_host, up_w13_host, "up");
   if (active_mode) {
     gate_mismatches += compare_u16(gate_ref_host, gate_compact_host, "gate_compact");
     up_mismatches += compare_u16(up_ref_host, up_compact_host, "up_compact");
+    gate_mismatches += compare_u16(w2_capacity_host, w2_compact_host, "w2_compact");
   }
   if (gate_mismatches || up_mismatches) {
     std::fprintf(stderr, "FUZZ FAIL gate_mismatches=%d up_mismatches=%d\n",
@@ -376,12 +464,18 @@ int main(int argc, char** argv) {
     run_baseline();
     run_w13();
     if (active_mode) run_w13_compact();
+    if (active_mode) {
+      run_w2_capacity();
+      run_w2_compact();
+    }
   }
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   float baseline_ms = time_ms(stream, args.iters, run_baseline);
   float w13_ms = time_ms(stream, args.iters, run_w13);
   float compact_w13_ms = active_mode ? time_ms(stream, args.iters, run_w13_compact) : 0.0f;
+  float w2_capacity_ms = active_mode ? time_ms(stream, args.iters, run_w2_capacity) : 0.0f;
+  float compact_w2_ms = active_mode ? time_ms(stream, args.iters, run_w2_compact) : 0.0f;
 
   std::printf("W13 grouped FP4 fuzz: PASS rows=%d experts=%d seed=%d\n",
               args.rows, args.experts, args.seed);
@@ -399,6 +493,9 @@ int main(int argc, char** argv) {
     std::printf("\n");
     std::printf("compact_w13_one_gemm_ms=%.6f\n", compact_w13_ms);
     std::printf("compact_vs_capacity_speedup=%.3fx\n", w13_ms / compact_w13_ms);
+    std::printf("w2_capacity_gemm_ms=%.6f\n", w2_capacity_ms);
+    std::printf("compact_w2_gemm_ms=%.6f\n", compact_w2_ms);
+    std::printf("compact_w2_vs_capacity_speedup=%.3fx\n", w2_capacity_ms / compact_w2_ms);
   }
 
   CUDA_CHECK(cudaStreamDestroy(stream));

@@ -655,17 +655,17 @@ capacity: local_experts = 32, expert_indptr has N nonempty experts and the rest 
 compact:  local_experts = N, compact pointer arrays and compact expert_indptr
 ```
 
-Both outputs are bitwise compared against the existing two-GEMM baseline. This directly tests whether merely shrinking the expert dimension of the launch is enough.
+W13 outputs are bitwise compared against the existing two-GEMM baseline. In active mode, the tool also builds an equivalent W2 grouped GEMM problem and bitwise compares capacity W2 against compact W2. This directly tests whether merely shrinking the expert dimension of the launch is enough for either routed grouped GEMM.
 
 5090 results:
 
-| Active experts | Rows per active | Capacity W13 | Compact W13 | Compact speedup |
-| ---: | ---: | ---: | ---: | ---: |
-| `1` | `8` | `0.061482ms` | `0.061479ms` | `1.000x` |
-| `3` | `8` | `0.063062ms` | `0.062033ms` | `1.017x` |
-| `6` | `8` | `0.122831ms` | `0.122831ms` | `1.000x` |
+| Active experts | Rows per active | Capacity W13 | Compact W13 | W13 compact speedup | Capacity W2 | Compact W2 | W2 compact speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `1` | `8` | `0.061482ms` | `0.061536ms` | `0.999x` | `0.032759ms` | `0.032764ms` | `1.000x` |
+| `3` | `8` | `0.063314ms` | `0.062743ms` | `1.009x` | `0.032761ms` | `0.032767ms` | `1.000x` |
+| `6` | `8` | `0.122856ms` | `0.122886ms` | `1.000x` | `0.063469ms` | `0.063469ms` | `1.000x` |
 
-Interpretation: the current TileLang grouped W13 early-return path already makes empty expert slots nearly free for this shape. The performance jumps are tied to how many active expert tiles fit into waves, not to the existence of 32 pointer slots by itself. A useful next prototype must change the actual active GEMM scheduling or fuse across the W13/W2 boundary; compacting pointer arrays alone should not be moved into runtime.
+Interpretation: the current TileLang grouped W13/W2 early-return path already makes empty expert slots nearly free for this shape. The performance jumps are tied to how many active expert tiles fit into waves, not to the existence of 32 pointer slots by itself. A useful next prototype must change the actual active GEMM scheduling or fuse across the W13/W2 boundary; compacting pointer arrays alone should not be moved into runtime.
 
 Evidence required for each adoption step:
 
@@ -685,7 +685,7 @@ These are worth remembering because they looked plausible:
 | Fuse expand with W13 activation quant | Bitwise microbench PASS and `2.5-3.2x` faster locally, but runtime repeated at `27.20-28.71ms/token` | Local microbench wins that remove only a tiny section can disappear in full decode; require full-runtime proof before retaining. |
 | Skip W2 SwiGLU+quant rows after GPU `local_count` | Exact-safe and hash-stable, but regressed to `31.22-31.34ms/token` | Adding a device-side count read and row predicate inside a tiny regular kernel is the wrong granularity. |
 | Shrink grouped GEMM row-tile bound to `seq_len` | Exact-safe and hash-stable, but regressed to `28.46-28.74ms/token` | Empty row tiles are not the dominant grouped FP4 cost; the expert scheduling dimension remains too coarse. |
-| Compact active expert pointer arrays | Bitwise microbench PASS, but compact W13 was only `1.000-1.017x` versus capacity W13 | Empty expert slots are already cheap in TileLang grouped W13; runtime active-list work needs a different scheduler, not pointer-array compaction alone. |
+| Compact active expert pointer arrays | Bitwise microbench PASS, but compact W13/W2 was only `0.999-1.009x` versus capacity W13/W2 | Empty expert slots are already cheap in TileLang grouped GEMM; runtime active-list work needs a different scheduler, not pointer-array compaction alone. |
 | Fuse final HC head plus RMSNorm | Exact-safe but regressed TPOT | Saving small launches can lose to worse reduction/kernel shape. |
 | Reuse deterministic window top-k across layers | Exact-safe, no stable long-bench win | Launch-count reduction alone is weak evidence. |
 | Fuse KV RoPE plus no-PE quant | Exact-safe, regressed short decode | Combining tiny kernels can hurt scheduling/occupancy. |
@@ -806,7 +806,7 @@ Local:
 - rejected W2 valid-row fixed bench log `/tmp/dsv4_valid_rows_bench.log`: aggregate steady TPOT avg `31.270ms`, per-iteration `31.220ms`, `31.342ms`, `31.248ms`; all hash `6346f03343d75a65`
 - rejected grouped GEMM row-tile upper-bound exact E2E log `/tmp/dsv4_max_expert_rows_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
 - rejected grouped GEMM row-tile upper-bound fixed bench log `/tmp/dsv4_max_expert_rows_bench.log`: per-iteration steady TPOT avg `28.504ms`, `28.460ms`, `28.735ms`; all hash `6346f03343d75a65`
-- active-expert W13 compact-pointer microbench on 5090: `/tmp/w13_grouped_fp4_bench --experts 32 --active-experts {1,3,6} --rows-per-active 8`; bitwise PASS, compact speedup `1.000x`, `1.017x`, `1.000x`
+- active-expert W13/W2 compact-pointer microbench on 5090: `/tmp/w13_grouped_fp4_bench --experts 32 --active-experts {1,3,6} --rows-per-active 8`; bitwise PASS, W13 compact speedup `0.999x`, `1.009x`, `1.000x`, W2 compact speedup `1.000x`, `1.000x`, `1.000x`
 - `gcc -shared -fPIC -O2 -Wall -Wextra -o /tmp/cuda_api_counter.so tools/cuda_api_counter.c -ldl`
 - `nm -D /tmp/cuda_api_counter.so` confirmed base and `_ptsz` wrappers
 
