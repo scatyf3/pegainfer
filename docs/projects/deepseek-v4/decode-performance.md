@@ -5,16 +5,39 @@
 
 ## TL;DR
 
-This document consolidates the DeepSeek V4 decode work that moved fixed long decode from the `~108-113ms/token` band to the current retained MoE overlap band of `26.28-29.29ms/token` in fresh repeats, with prior small-route mapping validation at about `27.61-27.83ms/token`, clean sub-30 validation at `29.86-29.97ms/token`, earlier shared-expert fused repeats at `28.16-32.22ms/token`, routed W13+SwiGLU-quant validation at `31.18-33.42ms/token`, W13-only validation at `31.99-34.22ms/token`, and shared-quant-only validation at `33.33-34.29ms/token`. The retained changes are grouped MoE pointer caching, rank-worker placement, removal of hot temporary zero-fill, rank-owned decode scratch, caller-owned grouped FP4 workspace, shared W1/W3 activation quantization, W13 grouped FP4 runtime launch, routed fused SwiGLU+W2 activation quantization, shared expert fused W1/W3 quant, shared fused SwiGLU+W2 quant, shared dense FP8 W13, fused MoE mapping clear, small-route MoE mapping, fused Q/KV RoPE in attention projection, removal of old split MoE/SwiGLU public and FFI entry points, MoE all-gather/reduce-scatter shared-expert overlap, score-route BF16 direct GEMM cleanup, grouped FP4 dynamic shared-memory downsizing, and benchmark/counter instrumentation. Stable sub-`30ms/token` is achieved on the fixed bench; the active MoE goal is now stable sub-`25ms/token` by mirroring mature vLLM/SGLang decode MoE decomposition and only then exploring deeper fusion without bs=1 specialization. Post-small-route experiments rejected so far: direct route-W13 regressed to `33.14-33.36ms/token`; fused expand+act_quant was bitwise and `2.5-3.2x` faster in microbench but repeated runtime TPOT landed at `27.20-28.71ms/token`; GPU-side valid-row skip in W2 SwiGLU+quant regressed to `31.22-31.34ms/token`; host-known per-expert row-tile upper bound kept exactness but landed at `28.46-28.74ms/token`; grouped FP4 `block_M=16` was bitwise in broad fuzz but fixed bench regressed to `28.97-29.80ms/token`; standalone TileLang SwiGLU+FP8 quant was byte-identical but slower than the current C++ fused kernel for rows `48` and `96`, and only tied at rows `192`; hand-written routed W13 act_quant was bitwise and `2.0-3.0x` faster than TileLang in microbench but regressed runtime to `28.80ms` and was reverted; W2 epilogue-style atomic TopK weight/reduce was `0.38-0.53x` of the current deterministic reduce for DSV4 `topk=6`; HC direct mixes was `3.6-9.0x` faster than the cuBLAS path for `seq_len<=16` in microbench, but changed the fixed long-decode token hash; full shared-expert overlap from MoE entry kept exact E2E but changed the fixed long-decode token hash; splitting shared expert around AG/RS stayed exact but did not beat the simpler all-gather overlap; replacing hash-layer token-id all-gather with a GPU repeat kernel stayed exact but did not improve TPOT; sharing WQ_A/WKV input FP8 quant stayed exact but regressed fixed bench to `28.67ms` and was reverted; caching score-route gate weights as F32 stayed exact but regressed to `29.15ms` and was reverted. Exact E2E remains `20/20`, and the retained fixed bench token hash remains `6346f03343d75a65`.
+DeepSeek V4 fixed long-decode TPOT moved from the `~108-113ms/token` band to retained sub-`30ms/token`; stable sub-`25ms/token` remains open.
 
-The retained team lessons are more important than the discarded attempt logs: compare identical token traces, separate NCCL wait from transfer, treat capacity and logical length separately, keep MoE semantic zero on device, and prove allocation cleanup with application-visible CUDA API counters rather than nsys attribution alone.
+Retained runtime changes:
+
+- GPU-resident grouped MoE route mapping, pointer caching, rank-owned scratch, and removal of hot temporary zero-fill.
+- Routed FP4 `W13 grouped GEMM -> fused SwiGLU + W2 activation quant -> W2 grouped GEMM`.
+- Shared expert fused W1/W3 and fused SwiGLU+W2 FP8 paths.
+- MoE all-gather/reduce-scatter overlap with shared expert compute.
+- Fused Q/KV RoPE, score-route BF16 direct GEMM cleanup, parallel score-select, grouped FP4 shared-memory downsizing, and benchmark/counter instrumentation.
+- Removal of old split MoE/SwiGLU public and FFI entry points so runtime callers stay on the retained path.
+
+Current evidence:
+
+- Exact E2E remains `20/20`.
+- Fixed bench generated-token hash remains `6346f03343d75a65`.
+- Best retained repeats reached the `26.28-27.31ms/token` band.
+- Fresh reviewer 5090 5-run sweep observed aggregate steady TPOT avg `27.55-29.76ms`, with all 15 hashes matching `6346f03343d75a65`.
+- Rejected experiments are recorded below with microbench/E2E/fixed-bench evidence; they are not retained production paths.
+
+## Team Lessons
+
+- Compare identical token traces, not only exact E2E summaries.
+- Separate NCCL wait-inclusive time from pure transfer time.
+- Treat capacity and logical length as different optimization variables.
+- Keep MoE semantic zero on device.
+- Prove allocation cleanup with application-visible CUDA API counters rather than Nsight attribution alone.
 
 ## Current Completion Audit
 
 | Requirement | Evidence | Status |
 | --- | --- | --- |
 | Main objective: stable sub-`25ms/token` DeepSeek V4 decode without bs=1 or seq_len=1 specialization | Best retained repeats reached the `26.28-27.31ms/token` band; fresh 5-run stability sweep after the latest rejected act_quant probe is `28.29-28.91ms` aggregate steady TPOT while another CPU load was running | Not achieved. Keep the goal active. |
-| Fixed bench stable sub-30 with hash `6346f03343d75a65` | `/tmp/dsv4_stability_after_act_quant_revert_{1..5}.json` records 5 consecutive fixed bench runs, aggregate steady TPOT avg `28.291-28.912ms`, and all 15 per-iteration hashes `6346f03343d75a65`; the machine also had another CPU load running during this sweep | Achieved for the retained tree. |
+| Fixed bench stable sub-30 with hash `6346f03343d75a65` | `/tmp/dsv4_stability_after_act_quant_revert_{1..5}.json` records 5 consecutive fixed bench runs, aggregate steady TPOT avg `28.291-28.912ms`, and all 15 per-iteration hashes `6346f03343d75a65`; reviewer rerun `/tmp/pegainfer_dev_pr101_bench_{1..5}.json` observed aggregate steady TPOT avg `27.552965-29.755957ms`, again with all 15 hashes `6346f03343d75a65` | Achieved for the retained tree. |
 | Exact E2E remains `20/20` | `/tmp/dsv4_fresh_e2e_after_w2_reduce_doc.log` records `All 20 DeepSeek V4 exact cases passed` | Achieved for the retained tree. |
 | Public vLLM/SGLang MoE decomposition is replicated first | Runtime uses routed FP4 `W13 grouped GEMM -> fused SwiGLU + W2 activation quant -> W2 grouped GEMM`; old split W1/W3/SwiGLU/W2 public and FFI paths are removed | Achieved. |
 | Deeper W13 accumulator -> SwiGLU -> W2-quant path is explored only after microbench/fuzz | TileLang W13 accumulator prototype was compiled after lowering fixes but failed the first active-expert fuzz shape, so it was removed before runtime integration | Explored and rejected; still open as a future true tensor-core epilogue project. |
@@ -277,11 +300,11 @@ After reverting the direct-write top-k experiment and rebuilding 5090 release bi
 
 Rejected follow-up: sharing the input FP8 activation quantization between attention WQ_A and WKV kept exact E2E `20/20` and preserved hash `6346f03343d75a65`, but the fixed bench regressed to aggregate steady TPOT avg `28.672ms`, with per-iteration `28.414ms`, `28.432ms`, and `29.169ms`. The wrapper was removed from Rust/CUDA/FFI, and the post-revert fixed bench returned to aggregate steady TPOT avg `28.310ms`, with per-iteration `28.428ms`, `28.453ms`, and `28.050ms`. The likely lesson is that WQ_A/WKV already launch efficient TileLang FP8 linears, while sharing quant adds an extra runtime wrapper and does not remove enough downstream work to matter.
 
-## Active MoE Sub-30 Work
+## Active MoE Sub-25 Work
 
 ### Goal
 
-Drive decode MoE from roughly `17-19ms/token` toward `10-12ms/token`, enough to move overall fixed long decode from roughly `35ms/token` to stable `28-30ms/token`. Optimizations must remain batch-general, keep route/tile scheduling on GPU, and preserve exact E2E `20/20`.
+Drive decode MoE below the current retained sub-`30ms/token` band toward stable sub-`25ms/token`. Optimizations must remain batch-general, keep route/tile scheduling on GPU, and preserve exact E2E `20/20`.
 
 ### Attempt: fuse SwiGLU with W2 activation quant
 
@@ -1866,6 +1889,7 @@ Local:
 - post-revert hand act_quant exact E2E log `/tmp/dsv4_act_quant_restored_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
 - post-revert hand act_quant fixed bench logs `/tmp/dsv4_act_quant_restored_bench.json` and `/tmp/dsv4_act_quant_restored_bench_repeat.json`: first run aggregate steady TPOT avg `28.249ms` but one iteration hash changed to `a278a8140c25b812`; repeat aggregate steady TPOT avg `29.277ms`, per-iteration `29.265ms`, `29.272ms`, `29.293ms`, with all hashes restored to `6346f03343d75a65`
 - post-revert hand act_quant 5-run stability logs `/tmp/dsv4_stability_after_act_quant_revert_{1..5}.json`: aggregate steady TPOT avg `28.912ms`, `28.867ms`, `28.291ms`, `28.375ms`, and `28.715ms`; all 15 per-iteration hashes were `6346f03343d75a65`. Another CPU load was running during this sweep, so the result is a conservative sub-30 stability check rather than a clean machine best-band.
+- reviewer 5090 5-run stability rerun `/tmp/pegainfer_dev_pr101_bench_{1..5}.json`: aggregate steady TPOT avg `28.505793ms`, `28.087102ms`, `29.755957ms`, `27.552965ms`, and `29.371630ms`; all 15 per-iteration hashes were `6346f03343d75a65`. One run wrote the complete JSON report and logged scheduler exit, then segfaulted in NCCL shutdown; treat that as the existing shutdown cleanup issue, not decode TPOT or token-correctness evidence.
 - fused Q/KV RoPE exact E2E log `/tmp/dsv4_qkv_rope_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
 - fused Q/KV RoPE fixed bench logs `/tmp/dsv4_qkv_rope_bench.log` and `/tmp/dsv4_qkv_rope_bench_repeat.log`: per-iteration steady TPOT avg `28.215ms`, `28.256ms`, `28.236ms`, then `27.096ms`, `28.565ms`, `28.349ms`; all hash `6346f03343d75a65`
 - fused Q/KV RoPE short profile `/tmp/dsv4_qkv_rope_short.nsys-rep` and `/tmp/dsv4_qkv_rope_short_kernels_cuda_gpu_kern_sum.csv`: `deepseek_apply_rope_q_kv_kernel` appears in the kernel summary; residual hidden-RoPE kernels are from non-projection paths.
