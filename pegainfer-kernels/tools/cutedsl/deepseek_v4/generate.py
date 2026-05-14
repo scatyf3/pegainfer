@@ -24,6 +24,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor
 
+LOCAL_HEADS = 8
+HEAD_DIM = 128
+
 
 def load_sm120_gemm_class(cutlass_root: Path):
     gemm_path = find_sm120_dense_gemm_path(cutlass_root)
@@ -80,6 +83,7 @@ def write_wrapper(out_dir: Path) -> Path:
     wrapper.write_text(
         r'''
 #include "deepseek_indexer_dots_gemm.h"
+#include "deepseek_indexer_scores_exact.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -97,12 +101,18 @@ struct IndexerDotsWarmupShape {
 };
 
 idx_gemm_Kernel_Module_t g_indexer_dots_module;
+idx_scores_Kernel_Module_t g_indexer_scores_module;
 std::once_flag g_indexer_dots_once;
+std::once_flag g_indexer_scores_once;
 std::mutex g_indexer_dots_launch_mutex;
 IndexerDotsWarmupShape g_indexer_dots_warmup_shapes[kMaxIndexerDotsWarmupShapes];
 
 void load_indexer_dots_module_once() {
   idx_gemm_Kernel_Module_Load(&g_indexer_dots_module);
+}
+
+void load_indexer_scores_module_once() {
+  idx_scores_Kernel_Module_Load(&g_indexer_scores_module);
 }
 
 bool mark_indexer_dots_shape_for_warmup(int rows, int compressed_len) {
@@ -176,9 +186,96 @@ extern "C" cudaError_t deepseek_cutedsl_indexer_dots_bf16_cuda(
   }
   return cudaGetLastError();
 }
+
+extern "C" cudaError_t deepseek_cutedsl_indexer_scores_exact_bf16_cuda(
+    const __nv_bfloat16 *q,
+    const __nv_bfloat16 *kv,
+    const __nv_bfloat16 *weights,
+    float *scores,
+    int seq_len,
+    int compressed_len,
+    float score_scale,
+    cudaStream_t stream) {
+  if (q == nullptr || kv == nullptr || weights == nullptr || scores == nullptr ||
+      seq_len <= 0 || compressed_len <= 0) {
+    return cudaErrorInvalidValue;
+  }
+
+  std::call_once(g_indexer_scores_once, load_indexer_scores_module_once);
+
+  idx_scores_Tensor_q_t q_arg{};
+  q_arg.data = const_cast<__nv_bfloat16 *>(q);
+  q_arg.dynamic_shapes[0] = seq_len;
+
+  idx_scores_Tensor_kv_t kv_arg{};
+  kv_arg.data = const_cast<__nv_bfloat16 *>(kv);
+  kv_arg.dynamic_shapes[0] = compressed_len;
+
+  idx_scores_Tensor_weights_t weights_arg{};
+  weights_arg.data = const_cast<__nv_bfloat16 *>(weights);
+  weights_arg.dynamic_shapes[0] = seq_len;
+
+  idx_scores_Tensor_scores_t scores_arg{};
+  scores_arg.data = scores;
+  scores_arg.dynamic_shapes[0] = seq_len;
+  scores_arg.dynamic_shapes[1] = compressed_len;
+  scores_arg.dynamic_strides[0] = compressed_len;
+
+  int32_t ret = cute_dsl_idx_scores_wrapper(
+      &g_indexer_scores_module, &q_arg, &kv_arg, &weights_arg, &scores_arg,
+      score_scale, stream);
+  if (ret != 0) {
+    return cudaErrorUnknown;
+  }
+  return cudaGetLastError();
+}
 '''.lstrip()
     )
     return wrapper
+
+
+@cute.kernel
+def indexer_scores_exact_kernel(
+    q: cute.Tensor,
+    kv: cute.Tensor,
+    weights: cute.Tensor,
+    scores: cute.Tensor,
+    score_scale: cutlass.Float32,
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    compressed_len = scores.shape[1]
+    idx = bidx * 128 + tidx
+    total = scores.shape[0] * compressed_len
+    if idx < total:
+        token = idx // compressed_len
+        compressed = idx - token * compressed_len
+        acc = cutlass.Float32(0.0)
+        for head in cutlass.range(LOCAL_HEADS, unroll_full=True):
+            dot = cutlass.Float32(0.0)
+            for dim in cutlass.range(HEAD_DIM, unroll_full=True):
+                dot += cutlass.Float32(q[token, head, dim]) * cutlass.Float32(kv[compressed, dim])
+            if dot > cutlass.Float32(0.0):
+                acc += dot * cutlass.Float32(weights[token, head])
+        scores[token, compressed] = acc * score_scale
+
+
+@cute.jit
+def indexer_scores_exact(
+    q: cute.Tensor,
+    kv: cute.Tensor,
+    weights: cute.Tensor,
+    scores: cute.Tensor,
+    score_scale: cutlass.Float32,
+    stream: cuda.CUstream,
+):
+    total = scores.shape[0] * scores.shape[1]
+    blocks = (total + 127) // 128
+    indexer_scores_exact_kernel(q, kv, weights, scores, score_scale).launch(
+        grid=(blocks, 1, 1),
+        block=(128, 1, 1),
+        stream=stream,
+    )
 
 
 def main() -> None:
@@ -197,7 +294,9 @@ def main() -> None:
     Sm120GemmKernel = load_sm120_gemm_class(cutlass_root)
 
     rows = cute.SymInt(divisibility=8)
+    seq_len = cute.SymInt(divisibility=1)
     compressed_len = cute.SymInt(divisibility=8)
+    scores_compressed_len = cute.SymInt(divisibility=1)
     q = make_fake_compact_tensor(
         cutlass.BFloat16,
         (rows, 128, 1),
@@ -222,11 +321,41 @@ def main() -> None:
         file_name="deepseek_indexer_dots_gemm",
         function_prefix="idx_gemm",
     )
+    q_scores = make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (seq_len, LOCAL_HEADS, HEAD_DIM),
+        stride_order=(2, 1, 0),
+    )
+    kv_scores = make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (scores_compressed_len, HEAD_DIM),
+        stride_order=(1, 0),
+    )
+    weights_scores = make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (seq_len, LOCAL_HEADS),
+        stride_order=(1, 0),
+    )
+    scores = make_fake_compact_tensor(
+        cutlass.Float32,
+        (seq_len, scores_compressed_len),
+        stride_order=(1, 0),
+    )
+    score_scale = cutlass.Float32(0.125)
+    compiled_scores = cute.compile(
+        indexer_scores_exact, q_scores, kv_scores, weights_scores, scores, score_scale, stream
+    )
+    compiled_scores.export_to_c(
+        file_path=str(out_dir),
+        file_name="deepseek_indexer_scores_exact",
+        function_prefix="idx_scores",
+    )
     wrapper = write_wrapper(out_dir)
 
     runtime_libs = cute.runtime.find_runtime_libraries(enable_tvm_ffi=False)
     runtime_dirs = sorted({str(Path(path).resolve().parent) for path in runtime_libs})
     print(f"OBJ_PATH={out_dir / 'deepseek_indexer_dots_gemm.o'}")
+    print(f"OBJ_PATH={out_dir / 'deepseek_indexer_scores_exact.o'}")
     print(f"HEADER_DIR={out_dir}")
     print(f"WRAPPER_PATH={wrapper}")
     for runtime_dir in runtime_dirs:

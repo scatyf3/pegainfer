@@ -9,6 +9,10 @@ autotests = false
 [features]
 default = []
 deepseek-v4 = ["pegainfer-kernels/deepseek-v4"]
+deepseek-v4-cutedsl-diagnostic = [
+    "deepseek-v4",
+    "pegainfer-kernels/deepseek-v4-cutedsl-diagnostic",
+]
 
 [dependencies]
 anyhow = { workspace = true }

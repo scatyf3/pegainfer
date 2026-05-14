@@ -27,6 +27,17 @@ unsafe extern "C" {
         compressed_len: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    fn deepseek_cutedsl_indexer_scores_exact_bf16_cuda(
+        q: *const ffi::Half,
+        kv: *const ffi::Half,
+        weights: *const ffi::Half,
+        scores: *mut f32,
+        seq_len: i32,
+        compressed_len: i32,
+        score_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
 }
 
 struct DeviceBuffer<T> {
@@ -216,6 +227,33 @@ fn cutedsl_scores(
     Ok(scores)
 }
 
+fn cutedsl_exact_scores(
+    q_d: &DeviceBuffer<ffi::Half>,
+    kv_d: &DeviceBuffer<ffi::Half>,
+    weights_d: &DeviceBuffer<ffi::Half>,
+    seq_len: usize,
+    compressed_len: usize,
+    score_scale: f32,
+    stream: CUstream,
+) -> Result<Vec<f32>> {
+    let mut scores_d = DeviceBuffer::from_host(&vec![0.0f32; seq_len * compressed_len])?;
+    let result = unsafe {
+        deepseek_cutedsl_indexer_scores_exact_bf16_cuda(
+            q_d.as_ptr(),
+            kv_d.as_ptr(),
+            weights_d.as_ptr(),
+            scores_d.as_mut_ptr(),
+            seq_len as i32,
+            compressed_len as i32,
+            score_scale,
+            stream,
+        )
+    };
+    assert_cuda_success(result);
+    cuda_check(unsafe { cudaDeviceSynchronize() })?;
+    scores_d.copy_to_host()
+}
+
 fn assert_close(got: &[f32], expected: &[f32]) {
     assert_eq!(got.len(), expected.len());
     for (idx, (&got, &expected)) in got.iter().zip(expected).enumerate() {
@@ -301,11 +339,10 @@ fn indexer_scores_prefill_cutedsl_aot_matches_reference() -> Result<()> {
 }
 
 #[test]
-#[ignore = "diagnostic documents current CuTeDSL score drift before runtime enablement"]
-fn indexer_scores_prefill_cutedsl_serial_topk_diagnostic() -> Result<()> {
+fn indexer_scores_prefill_cutedsl_exact_matches_serial_topk_shape() -> Result<()> {
     let seq_len = 512usize;
-    let local_heads = 64usize;
-    let compressed_len = 128usize;
+    let local_heads = 8usize;
+    let compressed_len = 129usize;
     let topk = 32usize;
     let ratio = 4usize;
     let score_scale = 0.125f32;
@@ -321,12 +358,11 @@ fn indexer_scores_prefill_cutedsl_serial_topk_diagnostic() -> Result<()> {
     let mut serial_scores_d = DeviceBuffer::from_host(&vec![0.0f32; seq_len * compressed_len])?;
     let stream: CUstream = ptr::null_mut();
 
-    let cutedsl = cutedsl_scores(
+    let cutedsl = cutedsl_exact_scores(
         &q_d,
         &kv_d,
-        &weights,
+        &weights_d,
         seq_len,
-        local_heads,
         compressed_len,
         score_scale,
         stream,
@@ -376,12 +412,13 @@ fn indexer_scores_prefill_cutedsl_serial_topk_diagnostic() -> Result<()> {
         }
     }
 
-    println!(
-        "CuTeDSL diagnostic: first_topk_mismatches={mismatches:?}, max_abs={max_abs} at {max_abs_idx}, max_rel={max_rel}"
+    assert!(
+        mismatches.is_empty(),
+        "CuTeDSL exact score path changed top-k: first mismatches={mismatches:?}, max_abs={max_abs} at {max_abs_idx}, max_rel={max_rel}"
     );
     assert!(
-        !mismatches.is_empty(),
-        "diagnostic expected to expose current CuTeDSL score/top-k drift"
+        max_abs == 0.0,
+        "CuTeDSL exact score path changed scores: max_abs={max_abs} at {max_abs_idx}, max_rel={max_rel}"
     );
     Ok(())
 }
