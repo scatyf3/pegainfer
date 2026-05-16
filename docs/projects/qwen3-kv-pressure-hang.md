@@ -71,10 +71,11 @@
   - `~/.cargo/bin/cargo fmt --check` — passed.
 
 ### Step 4: E2E and serving pressure validation
-- Installed `vllm 0.21.0` in `/root/autodl-tmp/pegainfer-venv` to run the issue's real `vllm bench serve` client.
-- Refreshed `test_data/Qwen3-4B.json` with `regen_test_data` for the current HF revision, then ran:
-  - `PEGAINFER_TEST_MODEL_PATH=/root/autodl-tmp/work/pegainfer/models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e -- --nocapture`
-  - Result: passed, `1 passed`.
+- Installed `vllm 0.21.0` in the validation venv to run the issue's real `vllm bench serve` client.
+- Ran a host-local exact e2e check against the validation model snapshot:
+  - `PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e -- --nocapture`
+  - Result after local fixture regeneration for that model snapshot: passed, `1 passed`.
+  - PR review later found the regenerated fixture was not portable to the standard local model snapshot, so the repository `test_data/Qwen3-4B.json` change was reverted and this e2e result is not used as a merge gate.
 - Ran a small issue-shaped benchmark first:
   - `vllm bench serve ... --num-prompts 20 --request-rate 2 ...`
   - Result: `20/20` successful, `0` failed.
@@ -110,8 +111,13 @@
   - helper-level assertions for current/max KV token counts;
   - a scheduler regression proving `prompt_len=page_size, max_tokens=1` fits in one prompt page and finishes without a decode KV page.
 
+### Step 9: Maintainer review portability fixes
+- Maintainer review on PR #131 reproduced the issue-shaped HTTP pressure workload successfully on PR head `6b5f963`, then requested two portability fixes before merge.
+- Reverted `test_data/Qwen3-4B.json` to avoid carrying a non-portable exact-golden refresh in a scheduler/KV PR.
+- Rewrote validation evidence to use checkout-neutral paths such as `models/Qwen3-4B` and "validation venv" instead of machine-local absolute paths.
+
 ### Unexpected
-- The exact Qwen3-4B e2e initially failed because the checked-in golden text did not match the current HF revision/runtime output. This matches prior project history around Qwen3 greedy near-tie/golden drift. After regenerating the golden data for the current model snapshot, exact e2e passed.
+- The exact Qwen3-4B e2e initially failed because the checked-in golden text did not match the validation host's current HF revision/runtime output. This matches prior project history around Qwen3 greedy near-tie/golden drift. Maintainer review showed the regenerated fixture was not portable to the standard local model snapshot, so the fixture change was reverted and the scheduler/HTTP gates carry this PR.
 - DeepSeek diff-review was attempted twice and timed out (`180s`, then `300s`), so no external advisor result is counted.
 
 ## Debrief
@@ -119,7 +125,7 @@
 - **Outcome**: Issue #85's observed hang is addressed for the measured QPS=2 Qwen3-4B serving workload. Scheduler admission now keeps temporarily over-budget requests waiting instead of admitting them on prefill-only capacity, successful/client-dropped/error paths release request state, impossible requests surface as vLLM request errors, and the real `vllm bench serve` workload completed `500/500` with post-pressure completion still healthy.
 - **Pitfalls encountered**:
   - Full lifetime KV accounting is the basic no-preemption fix. Prefill-only accounting can still allow decode-time allocation failure when many active requests grow into new pages together.
-  - Exact text e2e depends on the model snapshot/golden pairing; using a current HF snapshot required refreshing `test_data/Qwen3-4B.json`.
+  - Exact text e2e depends on the model snapshot/golden pairing; do not refresh `test_data/Qwen3-4B.json` in scheduler PRs unless the regeneration contract is reproducible across the standard validation paths.
   - `vllm 0.21.0` installation pulled a large PyTorch/CUDA 13 stack. The install was slow but completed and enabled the real issue client.
   - CUDA feature selection mattered on the remote 5090: `cuda-13010` expects CUDA 13.1 driver API symbols, so validation hosts using CUDA 13.0 need a CUDA 13.1/compat runtime rather than a source-level downgrade.
 - **Lessons learned**:
