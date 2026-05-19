@@ -3154,6 +3154,7 @@ dependencies = [
  "pegainfer-qwen3-4b",
  "pegainfer-qwen35-4b",
  "rand 0.10.1",
+ "reqwest",
  "rmp-serde",
  "rmpv",
  "serde",

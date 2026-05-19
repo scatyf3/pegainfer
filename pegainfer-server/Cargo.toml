@@ -50,6 +50,7 @@ deepseek-v4 = ["dep:pegainfer-deepseek-v4", "pegainfer-deepseek-v4/deepseek-v4"]
 
 [dev-dependencies]
 criterion = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [lints]
 workspace = true

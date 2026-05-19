@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -216,6 +216,7 @@ impl LocalEngineBridge {
 pub async fn serve(
     handle: EngineHandle,
     model_path: &Path,
+    served_model_name: Option<&str>,
     port: u16,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -223,6 +224,7 @@ pub async fn serve(
     let input_address = ipc_endpoint(&namespace, "input.sock");
     let output_address = ipc_endpoint(&namespace, "output.sock");
     let max_model_len = load_max_model_len(model_path).unwrap_or(4096);
+    let (config_model, _served_guard) = resolve_served_model(model_path, served_model_name)?;
 
     let bridge = LocalEngineBridge {
         input_address: input_address.clone(),
@@ -245,7 +247,7 @@ pub async fn serve(
             ready_timeout: Duration::from_secs(30),
         },
         coordinator_mode: CoordinatorMode::None,
-        model: model_path.to_string_lossy().into_owned(),
+        model: config_model,
         listener_mode: HttpListenerMode::BindTcp {
             host: "0.0.0.0".to_string(),
             port,
@@ -510,6 +512,84 @@ fn load_max_model_len(model_path: &Path) -> Option<u32> {
         .max_model_len()
 }
 
+struct ServedModelGuard {
+    original_cwd: PathBuf,
+    scratch_dir: PathBuf,
+}
+
+impl Drop for ServedModelGuard {
+    fn drop(&mut self) {
+        if let Err(error) = std::env::set_current_dir(&self.original_cwd) {
+            warn!("failed to restore working directory: {error:#}");
+        }
+        if let Err(error) = std::fs::remove_dir_all(&self.scratch_dir) {
+            warn!("failed to remove served-model scratch dir: {error:#}");
+        }
+    }
+}
+
+fn resolve_served_model(
+    model_path: &Path,
+    served_model_name: Option<&str>,
+) -> Result<(String, Option<ServedModelGuard>)> {
+    let Some(name) = served_model_name else {
+        return Ok((model_path.to_string_lossy().into_owned(), None));
+    };
+
+    validate_served_model_name(name)?;
+
+    let target = model_path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize model path {}", model_path.display()))?;
+    if !target.is_dir() {
+        bail!("model path {} is not a directory", target.display());
+    }
+
+    let scratch_dir = std::env::temp_dir().join(format!(
+        "pegainfer-served-model-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&scratch_dir)
+        .with_context(|| format!("failed to create scratch dir {}", scratch_dir.display()))?;
+
+    let link = scratch_dir.join(name);
+    std::os::unix::fs::symlink(&target, &link).with_context(|| {
+        format!(
+            "failed to symlink {} -> {}",
+            link.display(),
+            target.display()
+        )
+    })?;
+
+    let original_cwd =
+        std::env::current_dir().context("failed to read current working directory")?;
+    std::env::set_current_dir(&scratch_dir)
+        .with_context(|| format!("failed to chdir to {}", scratch_dir.display()))?;
+
+    info!(
+        "serving model as '{}' (loading from {})",
+        name,
+        target.display()
+    );
+
+    Ok((
+        name.to_string(),
+        Some(ServedModelGuard {
+            original_cwd,
+            scratch_dir,
+        }),
+    ))
+}
+
+fn validate_served_model_name(name: &str) -> Result<()> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(component)), None) if component.to_str() == Some(name) => Ok(()),
+        _ => bail!("served model name {name:?} must be a single path component"),
+    }
+}
+
 pub fn shutdown_token_from_ctrl_c() -> CancellationToken {
     let token = CancellationToken::new();
     let shutdown = token.clone();
@@ -520,4 +600,84 @@ pub fn shutdown_token_from_ctrl_c() -> CancellationToken {
         shutdown.cancel();
     });
     token
+}
+
+#[cfg(test)]
+mod served_model_tests {
+    use super::*;
+    use std::sync::Mutex;
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    fn fake_model_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pegainfer-test-model-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"max_position_embeddings":4096}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+        dir
+    }
+
+    #[test]
+    fn none_returns_path_verbatim_and_no_guard() {
+        let model_dir = fake_model_dir();
+        let (config_model, guard) = resolve_served_model(&model_dir, None).unwrap();
+        assert_eq!(config_model, model_dir.to_string_lossy());
+        assert!(guard.is_none());
+        std::fs::remove_dir_all(&model_dir).ok();
+    }
+
+    #[test]
+    fn served_name_resolves_to_local_dir_and_is_clean() {
+        let _lock = CWD_LOCK.lock().unwrap();
+        let model_dir = fake_model_dir();
+        let original_cwd = std::env::current_dir().unwrap();
+
+        let (config_model, guard) = resolve_served_model(&model_dir, Some("Qwen3-4B")).unwrap();
+
+        assert_eq!(config_model, "Qwen3-4B");
+        assert!(Path::new(&config_model).is_dir());
+        assert!(Path::new(&config_model).join("config.json").exists());
+        assert!(Path::new(&config_model).join("tokenizer.json").exists());
+        let scratch = guard.as_ref().unwrap().scratch_dir.clone();
+        assert!(scratch.exists());
+        drop(guard);
+        assert_eq!(std::env::current_dir().unwrap(), original_cwd);
+        assert!(!scratch.exists());
+
+        std::fs::remove_dir_all(&model_dir).ok();
+    }
+
+    #[test]
+    fn custom_name_decoupled_from_dir_basename() {
+        let _lock = CWD_LOCK.lock().unwrap();
+        let model_dir = fake_model_dir();
+        let (config_model, guard) = resolve_served_model(&model_dir, Some("Llama-3-8B")).unwrap();
+        assert_eq!(config_model, "Llama-3-8B");
+        assert!(Path::new(&config_model).join("config.json").exists());
+        drop(guard);
+        std::fs::remove_dir_all(&model_dir).ok();
+    }
+
+    #[test]
+    fn rejects_unsafe_names() {
+        for bad in ["", "a/b", "..", ".", "/abs", "a/b/c", "foo/"] {
+            assert!(
+                validate_served_model_name(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        for good in ["Qwen3-4B", "gpt-4o-mini", "my_model.v2"] {
+            assert!(
+                validate_served_model_name(good).is_ok(),
+                "expected {good:?} to be accepted"
+            );
+        }
+    }
 }
