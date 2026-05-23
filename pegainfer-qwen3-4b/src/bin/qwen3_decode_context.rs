@@ -288,14 +288,20 @@ fn measure_contexts(args: &Args) -> Result<()> {
 }
 
 fn profiler_start() -> Result<()> {
-    let err = unsafe { pegainfer_core::ffi::cudaProfilerStart() };
-    anyhow::ensure!(err == 0, "cudaProfilerStart failed with cudaError={err}");
+    let err = unsafe { cudarc::driver::sys::cuProfilerStart() };
+    anyhow::ensure!(
+        err == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+        "cuProfilerStart failed with {err:?}"
+    );
     Ok(())
 }
 
 fn profiler_stop() -> Result<()> {
-    let err = unsafe { pegainfer_core::ffi::cudaProfilerStop() };
-    anyhow::ensure!(err == 0, "cudaProfilerStop failed with cudaError={err}");
+    let err = unsafe { cudarc::driver::sys::cuProfilerStop() };
+    anyhow::ensure!(
+        err == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+        "cuProfilerStop failed with {err:?}"
+    );
     Ok(())
 }
 

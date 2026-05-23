@@ -42,7 +42,10 @@ crossbeam-channel = "0.5"
 cudarc = { version = "0.19.4", features = [
     "cuda-version-from-build-system",
     "cublas",
-    "cuda-13010",
+    # cuda-13010 removed: this cluster's driver (580.82.07) maxes at CUDA 13.0 and
+    # lacks the 13.1-only cuDevSmResourceSplit symbol that cudarc resolves eagerly.
+    # Dropping the explicit feature lets cuda-version-from-build-system target the
+    # detected toolkit (CUDA 12.4 here), which runs fine on the newer 13.0 driver.
     "f16",
     "nccl",
 ] }
