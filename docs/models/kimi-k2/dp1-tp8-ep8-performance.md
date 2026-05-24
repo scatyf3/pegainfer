@@ -80,7 +80,7 @@ LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:
 PEGAINFER_CUDA_SM=90a \
 PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
-cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep -- \
+/root/.cargo/bin/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep -- \
   --model-path /data/models/Kimi-K2.5 \
   --port 8124 \
   --cuda-graph true
@@ -131,6 +131,31 @@ Required report fields:
 | `--percentile-metrics` | `ttft,tpot,itl` |
 | `--metric-percentiles` | `50,95,99` |
 
+Supporting in-process probe:
+
+Use this command when a change needs a lower-level bs64 number without HTTP,
+SSE, and vLLM bridge overhead. It is not a replacement for the canonical
+service pressure test; it exists to explain service deltas with a stable
+engine-side shape.
+
+```bash
+cd /root/develop/xingming/pegainfer
+COMMIT=$(git rev-parse --short HEAD)
+CUDA_HOME=/usr/local/cuda \
+NVCC=/usr/local/cuda/bin/nvcc \
+LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_KIMI_PARALLEL=tp8dp1 \
+/root/.cargo/bin/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep \
+  --bin bench_serving -- \
+  --model-path /data/models/Kimi-K2.5 \
+  --cuda-graph true \
+  --format json \
+  --out /tmp/kimi_pplx_tp8_micro_bs64_o128_${COMMIT}.json \
+  request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
+```
+
 ## Correctness Probe
 
 Run this before accepting a performance change, and compare it with the TP8 NCCL
@@ -144,7 +169,7 @@ LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:
 PEGAINFER_CUDA_SM=90a \
 PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
-cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
+/root/.cargo/bin/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
   --model-path /data/models/Kimi-K2.5 \
   --cuda-graph false \
   --format json \
@@ -162,6 +187,7 @@ cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_s
 | C1 | 2026-05-25 | this commit | correctness / PPLX MoE | Align TP8 PPLX with TP8 NCCL for active bs64 decode: active MoE rows, TP8-only duplicate-source canonicalization, NCCL-layout local expert compute before PPLX combine | `/tmp/kimi_pplx_tp8_active64_o5_after_review.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 per-index token mismatches; both paths hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | Not a performance optimization; PPLX correctness probe TPOT p50 `110.14ms` vs NCCL `97.53ms`; rerun canonical bs64 pressure after this correctness commit | Keep as the new correctness baseline before further optimization |
 | P1 | 2026-05-25 | documentation only | service / scheduler profile | Profile `00b3f1f` after C1 with the canonical bs64 command and an in-process bs64/output128 microbench | No code change after C1; C1 correctness baseline remains the gate | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.json`: output `353.91 tok/s`, TPOT p50/p95/p99 `146.15/172.83/175.10ms`, TTFT p50/p99 `4.58/10.24s`, 256/256 success; in-process warm1 steady TPOT p50 `107.76ms` | Keep as profile baseline; next optimization should target serial first-token prefill without changing token trace |
 | O2 | 2026-05-25 | this commit | scheduler / MLA prefill | Replace prompt_len=1 first-token MLA attention with the exact single-token V path; keep microbatch at 1 because seq_len>1 drifted | `/tmp/kimi_pplx_tp8_c1fast_mb1_o5.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fastmb1_candidate.json`: output `414.28 tok/s`, TPOT p50/p95/p99 `133.36/147.74/149.42ms`, TTFT p50/p99 `2.76/6.90s`, 256/256 success | Keep as an incremental first-token optimization; still below vLLM, next work must make batch>1 prompt_len=1 prefill correct or reduce PPLX TPOT |
+| O3 | 2026-05-25 | this commit | scheduler / prompt_len=1 prefill | Reuse prompt_len=1 dense/shared/router/Marlin scratch for the single-row prefill path, and widen the fixed admission coalesce window to `100ms` so bs64 pressure is admitted as one wave | `/tmp/kimi_pplx_tp8_o3_scratch_coalesce_o5.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.json`: output `492.34 tok/s`, TPOT p50/p95/p99 `121.05/124.99/125.58ms`, TTFT p50/p99 `0.67/3.96s`, 256/256 success | Keep as a measured bs64 improvement; still below vLLM, next work should attack service TPOT/ITL and PPLX steady decode |
 
 ### B1 Profile Notes
 
@@ -239,8 +265,6 @@ cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_s
   --format json \
   --out /tmp/kimi_pplx_tp8_o1_bucket_micro_bs64.json \
   request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 0 --iters 1
-```
-
 Result:
 
 - Output path: `/tmp/kimi_pplx_tp8_o1_bucket_micro_bs64.json`.
@@ -466,6 +490,111 @@ Keep. The change preserves the TP8 NCCL/PPLX correctness baseline and improves
 canonical bs64 output throughput by about `17%`. It does not reach vLLM
 `583.9 tok/s`; the next optimization should either make prompt_len=1 batch>1
 prefill trace-exact, or reduce the PPLX steady TPOT gap.
+
+### O3 Prompt-Len-1 Scratch Reuse And Admission Coalesce
+
+Profile:
+
+```text
+/tmp/kimi_pplx_tp8_o2_micro_bs64_o128_warm1.json
+/tmp/kimi_pplx_tp8_o3_scratch_micro_bs64_o128_warm1.json
+/tmp/kimi_pplx_tp8_o3_scratch_coalesce_micro_bs64_o128_warm1.json
+```
+
+Observed:
+
+- O2 in-process bs64/output128 was `458.5 tok/s` by `64 * 128 / max_e2e`,
+  with TTFT p50/p99 `2173.49/4127.33ms`, first-decode p50/p99
+  `2198.80/4171.37ms`, steady TPOT p50 `107.47ms`.
+- Code profile showed that the accepted prompt_len=1 path still allocated
+  dense MLP, shared expert, router, Marlin route/workspace, Marlin outputs, and
+  routed F32 buffers per MoE layer and per request.
+- The first scratch-only probe improved the first wave but split bs64 admission
+  into `40 + 24` requests:
+  `/tmp/kimi_pplx_tp8_o3_scratch_micro_bs64_o128_warm1.json` had
+  `max_e2e=25.594s`, about `320.1 tok/s`.
+- The split wave showed the fixed `20ms` coalesce window was too short for this
+  pressure shape. After widening it to `100ms`, the same in-process probe
+  admitted all `64` requests in one wave.
+
+Motivation / expected gain:
+
+The prompt_len=1 path is still intentionally serial at microbatch `1` because
+batch>1 trace parity is not proven. Reusing the existing decode arena scratch
+removes repeated GPU allocations without changing the math boundary: BF16 TP
+all-reduces stay BF16, routed MoE all-reduce stays F32, Marlin uses the same
+block size `8` as `kimi_marlin_block_size(1)`, and token trace remains gated
+against TP8 NCCL. The coalesce change trades up to `80ms` extra admission wait
+for avoiding a second full decode wave, which is worth seconds at bs64.
+
+Microbench:
+
+```bash
+cd /root/develop/xingming/pegainfer
+CUDA_HOME=/usr/local/cuda \
+NVCC=/usr/local/cuda/bin/nvcc \
+LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_KIMI_PARALLEL=tp8dp1 \
+/root/.cargo/bin/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep \
+  --bin bench_serving -- \
+  --model-path /data/models/Kimi-K2.5 \
+  --cuda-graph true \
+  --format json \
+  --out /tmp/kimi_pplx_tp8_o3_scratch_coalesce_micro_bs64_o128_warm1.json \
+  request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
+```
+
+Result:
+
+- Output path:
+  `/tmp/kimi_pplx_tp8_o3_scratch_coalesce_micro_bs64_o128_warm1.json`.
+- In-process wall throughput: `557.70 tok/s`
+  (`64 * 128 / 14.688772613s`).
+- TTFT p50/p95/p99: `505.53/927.55/957.74ms`.
+- First-decode p50/p95/p99: `597.01/1022.10/1052.56ms`.
+- Steady TPOT p50/p95/p99: `107.81/109.32/110.64ms`.
+- E2E p50/p95/p99/max: `14.686/14.689/14.689/14.689s`.
+
+Correctness gate:
+
+```text
+/tmp/kimi_pplx_tp8_o3_scratch_coalesce_o5.json
+/tmp/kimi_nccl_tp8_active64_o5_final.json
+```
+
+Observed:
+
+- Per-index generated-token trace mismatches: `0/64`.
+- Hash counter on both files: `32x 7c4c5d83355198fd`,
+  `32x 9eecc1ca6fb3409d`.
+
+Performance gate:
+
+Canonical bs64 service result:
+
+```text
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.log
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.json
+```
+
+Observed:
+
+- Successful requests: `256/256`.
+- Output throughput: `492.34 tok/s` vs O2 `414.28 tok/s`.
+- Peak output throughput: `592.00 tok/s`.
+- TTFT p50/p95/p99: `0.67/3.80/3.96s`.
+- TPOT p50/p95/p99: `121.05/124.99/125.58ms`.
+- ITL p50/p95/p99: `116.64/120.13/124.76ms`.
+
+Decision:
+
+Keep. O3 improves canonical bs64 output throughput by about `18.8%` over O2
+while preserving the TP8 NCCL/PPLX token trace gate. Revert this change if the
+canonical bs64 output throughput falls below O2's `414.28 tok/s`, if bs64
+admission again splits under the documented pressure command, or if the TP8
+NCCL/PPLX short-trace gate shows any mismatch.
 
 ## Candidate Queue
 

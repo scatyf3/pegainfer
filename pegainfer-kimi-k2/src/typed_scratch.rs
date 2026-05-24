@@ -15,6 +15,7 @@ use pegainfer_kernels::ops::{
 };
 
 pub(crate) const MARLIN_W13_OUT_DIM: usize = 2 * KIMI_K2_EXPERT_INTERMEDIATE;
+const PROMPT_LEN1_MARLIN_BLOCK_SIZE: usize = 8;
 
 pub(crate) struct MlaDecodeScratch {
     // TP-independent (global model dims)
@@ -130,6 +131,27 @@ impl MarlinExpertScratch {
     }
 }
 
+pub(crate) struct PromptLen1MoeScratch {
+    pub(crate) route_workspace: KimiMarlinRouteWorkspace,
+    pub(crate) marlin_workspace: KimiMarlinWna16Workspace,
+}
+
+impl PromptLen1MoeScratch {
+    pub(crate) fn new(ctx: &DeviceContext) -> Result<Self> {
+        let route_workspace = KimiMarlinRouteWorkspace::new(ctx, 1, PROMPT_LEN1_MARLIN_BLOCK_SIZE)?;
+        let marlin_workspace = KimiMarlinWna16Workspace::new(
+            ctx,
+            route_workspace.max_m_blocks,
+            KIMI_K2_HIDDEN,
+            PROMPT_LEN1_MARLIN_BLOCK_SIZE,
+        )?;
+        Ok(Self {
+            route_workspace,
+            marlin_workspace,
+        })
+    }
+}
+
 pub(crate) struct CommScratch {
     pub(crate) routed_out_f32: CudaSlice<f32>,
     pub(crate) routed_reduce_scatter_send_f32: CudaSlice<f32>,
@@ -171,6 +193,7 @@ pub(crate) struct KimiWorkerDecodeScratch {
     pub(crate) marlin: MarlinExpertScratch,
     pub(crate) marlin_route_workspace: KimiMarlinRouteWorkspace,
     pub(crate) marlin_workspace: KimiMarlinWna16Workspace,
+    pub(crate) prompt_len1_moe: PromptLen1MoeScratch,
     pub(crate) comm: CommScratch,
     pub(crate) sampling: SamplingScratch,
 }
@@ -213,6 +236,17 @@ impl KimiWorkerDecodeScratch {
             "shared_expert.activated",
             &mut self.shared_expert.activated,
             seq_len,
+        )?;
+        self.router.set_batch_size(seq_len);
+        let route_elems = seq_len
+            .checked_mul(KIMI_K2_TOPK)
+            .ok_or_else(|| anyhow::anyhow!("Kimi prompt route elem count overflow"))?;
+        set_gpu_tensor_seq_len("marlin.w13_out", &mut self.marlin.w13_out, route_elems)?;
+        set_gpu_tensor_seq_len("marlin.activated", &mut self.marlin.activated, route_elems)?;
+        set_gpu_tensor_seq_len(
+            "marlin.expert_output",
+            &mut self.marlin.expert_output,
+            route_elems,
         )?;
         Ok(())
     }

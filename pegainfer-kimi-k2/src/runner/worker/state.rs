@@ -375,30 +375,26 @@ impl KimiRankThreadState {
                 .with_context(|| format!("Kimi MLA prompt_len1 batch layer {}", layer.layer_idx))?;
                 match &layer.kind {
                     KimiLayerForwardKindCache::Dense(dense) => {
-                        forward_dense_mlp_batch_into(
+                        forward_dense_mlp_prefill_scratch_into(
                             &device_ctx,
                             tp_comm_ref,
                             dense,
                             &layer.attention.post_attention_norm,
-                            &mut decode_arena.scratch.mla.hidden,
-                            &mut decode_arena.scratch.mla.normed,
-                            &mut decode_arena.scratch.mla.projected,
+                            &mut decode_arena.scratch,
                         )
                         .with_context(|| {
                             format!("Kimi dense prompt_len1 batch MLP layer {}", layer.layer_idx)
                         })?;
                     }
                     KimiLayerForwardKindCache::Moe(moe) => {
-                        forward_moe_layer_batch_into(
+                        forward_moe_layer_prefill_scratch_into(
                             &device_ctx,
                             tp_comm_ref,
                             layer.layer_idx,
                             moe,
                             &layer.attention.post_attention_norm,
                             expert_kernels,
-                            &mut decode_arena.scratch.mla.hidden,
-                            &mut decode_arena.scratch.mla.normed,
-                            &mut decode_arena.scratch.mla.projected,
+                            &mut decode_arena.scratch,
                         )
                         .with_context(|| {
                             format!("Kimi MoE prompt_len1 batch layer {}", layer.layer_idx)
