@@ -188,6 +188,7 @@ PEGAINFER_KIMI_PARALLEL=tp8dp1 \
 | P1 | 2026-05-25 | documentation only | service / scheduler profile | Profile `00b3f1f` after C1 with the canonical bs64 command and an in-process bs64/output128 microbench | No code change after C1; C1 correctness baseline remains the gate | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.json`: output `353.91 tok/s`, TPOT p50/p95/p99 `146.15/172.83/175.10ms`, TTFT p50/p99 `4.58/10.24s`, 256/256 success; in-process warm1 steady TPOT p50 `107.76ms` | Keep as profile baseline; next optimization should target serial first-token prefill without changing token trace |
 | O2 | 2026-05-25 | this commit | scheduler / MLA prefill | Replace prompt_len=1 first-token MLA attention with the exact single-token V path; keep microbatch at 1 because seq_len>1 drifted | `/tmp/kimi_pplx_tp8_c1fast_mb1_o5.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fastmb1_candidate.json`: output `414.28 tok/s`, TPOT p50/p95/p99 `133.36/147.74/149.42ms`, TTFT p50/p99 `2.76/6.90s`, 256/256 success | Keep as an incremental first-token optimization; still below vLLM, next work must make batch>1 prompt_len=1 prefill correct or reduce PPLX TPOT |
 | O3 | 2026-05-25 | this commit | scheduler / prompt_len=1 prefill | Reuse prompt_len=1 dense/shared/router/Marlin scratch for the single-row prefill path, and widen the fixed admission coalesce window to `100ms` so bs64 pressure is admitted as one wave | `/tmp/kimi_pplx_tp8_o3_scratch_coalesce_o5.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.json`: output `492.34 tok/s`, TPOT p50/p95/p99 `121.05/124.99/125.58ms`, TTFT p50/p99 `0.67/3.96s`, 256/256 success | Keep as a measured bs64 improvement; still below vLLM, next work should attack service TPOT/ITL and PPLX steady decode |
+| O5 | 2026-05-25 | this commit | PPLX / MoE stream overlap | Start the PPLX decode router on the aux stream immediately after RMSNorm, matching the NCCL decode overlap window instead of waiting for shared expert/all-reduce | `/tmp/kimi_pplx_tp8_o5_router_overlap_o5.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o5_router_overlap_candidate.json`: output `509.89 tok/s`, TPOT p50/p95/p99 `116.53/120.45/121.44ms`, TTFT p50/p99 `0.67/3.95s`, 256/256 success | Keep as a measured PPLX decode improvement; still below vLLM, next work should remove PPLX TP8 dispatch/copy overhead |
 
 ### B1 Profile Notes
 
@@ -596,13 +597,114 @@ canonical bs64 output throughput falls below O2's `414.28 tok/s`, if bs64
 admission again splits under the documented pressure command, or if the TP8
 NCCL/PPLX short-trace gate shows any mismatch.
 
+### O5 PPLX Decode Router Overlap
+
+Profile:
+
+```text
+/tmp/kimi_pplx_tp8_o3_scratch_coalesce_micro_bs64_o128_warm1.json
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.json
+```
+
+Observed:
+
+- O3 in-process bs64/output128 steady TPOT p50/p95/p99 was
+  `107.81/109.32/110.64ms`, while canonical service TPOT p50/p95/p99 was
+  `121.05/124.99/125.58ms`.
+- Code inspection showed the NCCL decode MoE path records `norm_ready`
+  immediately after RMSNorm, then runs shared expert on the main stream while
+  router/routed work proceeds on the aux stream.
+- The PPLX decode MoE path recorded `norm_ready` only after shared expert and
+  its TP all-reduce, so the aux-stream router could not overlap the shared
+  expert window.
+
+Motivation / expected gain:
+
+Router uses only the post-attention normed hidden state, independent of shared
+expert output. Starting the PPLX router right after RMSNorm preserves the same
+math and stream dependency boundary as the NCCL decode path, while exposing
+more overlap before `dispatch_send`. Expected gain: a few milliseconds per
+steady bs64 decode step, with no token-trace change.
+
+Microbench:
+
+```bash
+cd /root/develop/xingming/pegainfer
+CUDA_HOME=/usr/local/cuda \
+NVCC=/usr/local/cuda/bin/nvcc \
+LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_KIMI_PARALLEL=tp8dp1 \
+/root/.cargo/bin/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep \
+  --bin bench_serving -- \
+  --model-path /data/models/Kimi-K2.5 \
+  --cuda-graph true \
+  --format json \
+  --out /tmp/kimi_pplx_tp8_o5_router_overlap_micro_bs64_o128_warm1.json \
+  request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
+```
+
+Result:
+
+- Output path:
+  `/tmp/kimi_pplx_tp8_o5_router_overlap_micro_bs64_o128_warm1.json`.
+- In-process wall throughput: `582.9 tok/s`
+  (`64 * 128 / 14.054035966s`).
+- TTFT p50/p95/p99: `504.81/925.43/955.54ms`.
+- First-decode p50/p95/p99: `590.84/1015.02/1045.38ms`.
+- Steady TPOT p50/p95/p99: `102.84/104.09/105.48ms`.
+- This improves O3 in-process steady TPOT p50 from `107.81ms` to
+  `102.84ms`.
+
+Correctness gate:
+
+```text
+/tmp/kimi_pplx_tp8_o5_router_overlap_o5.json
+/tmp/kimi_nccl_tp8_active64_o5_final.json
+```
+
+Observed:
+
+- Per-index generated-token trace mismatches: `0/64`.
+- Hash counter on both files: `32x 7c4c5d83355198fd`,
+  `32x 9eecc1ca6fb3409d`.
+- Short-probe steady TPOT p50: `105.53ms`.
+
+Performance gate:
+
+Canonical bs64 service result:
+
+```text
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o5_router_overlap_candidate.log
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o5_router_overlap_candidate.json
+```
+
+Observed:
+
+- Successful requests: `256/256`.
+- Output throughput: `509.89 tok/s` vs O3 `492.34 tok/s`.
+- Peak output throughput: `708.00 tok/s`.
+- TTFT p50/p95/p99: `0.67/3.80/3.95s`.
+- TPOT p50/p95/p99: `116.53/120.45/121.44ms`.
+- ITL p50/p95/p99: `112.12/115.18/119.38ms`.
+
+Decision:
+
+Keep. O5 preserves the TP8 NCCL/PPLX token trace gate and improves canonical
+bs64 output throughput by about `3.6%` over O3. Revert this change if the
+canonical bs64 output throughput falls below O3's `492.34 tok/s`, if the
+in-process steady TPOT p50 regresses above O3's `107.81ms`, or if the TP8
+NCCL/PPLX short-trace gate shows any mismatch.
+
 ## Candidate Queue
 
 | Priority | Area | Hypothesis | Correctness risk |
 | --- | --- | --- | --- |
 | P0 | scheduler / prefill | Implement an exact batched `prompt_len=1` first-token path instead of 64 serial `prefill_request` calls. It must preserve the C1 TP8 NCCL token trace, unlike the rejected decode-substitution probe. | High: first-token KV state affects all following tokens. |
-| P0 | PPLX / MoE | O1 shows real bs64 waves but TPOT p50 is `195.07ms`; routed expert dispatch/combine or Marlin route capacity may now dominate. | High: routed expert and combine weights are correctness-sensitive. |
-| P0 | CUDA Graph | Reduce bs64 first-step graph capture/replay and metadata overhead after kernel profile identifies host or graph-node cost. | Medium: graph replay must preserve per-row metadata and PPLX participation. |
+| P0 | PPLX / MoE | TP8 PPLX correctness currently computes local experts in NCCL layout and uses PPLX mainly for combine, but still runs full dispatch payload movement. Prototype route-only dispatch metadata and measure `pplx_a2a_bench` / nsys before changing model code. | High: dispatch still builds `token_offset`, `expert_offsets`, `padded_index`, and `combine_send_offset`; compare these hashes plus token trace. |
+| P0 | PPLX / MoE | TP8 PPLX scatters Marlin output into a compact PPLX buffer before `combine_send`. Profile `kimi_scatter_marlin_routes_to_compact` and consider a combine path that reads NCCL-layout rows directly. | High: duplicate-source canonicalization and BF16 row order must remain trace-exact. |
+| P1 | CUDA Graph | Reduce bs64 first-step graph capture/replay and metadata overhead after kernel profile identifies host or graph-node cost. | Medium: graph replay must preserve per-row metadata and PPLX participation. |
 | P1 | frontend | Measure HTTP/streaming overhead separately from in-process TPOT. | Low for model math, medium for serving semantics. |
 | P1 | collectives | Profile TP all-reduce and routed combine tail at bs64. | Medium: BF16/F32 collective boundary is correctness-sensitive. |
 | P2 | MLA/MoE | Retune batch-shape kernels only after scheduler and graph bottlenecks are visible. | High: routed expert and MLA cache layout are easy to perturb. |
@@ -614,3 +716,4 @@ NCCL/PPLX short-trace gate shows any mismatch.
 | 2026-05-25 | Use TP1/DP8 correctness as the baseline for this doc | Deferred. TP1/DP8 matched short probes but diverged at 32 tokens, so DP1 TP8 work uses TP8 NCCL/PPLX baseline first. |
 | 2026-05-25 | Use the batch decode kernel as the `prompt_len=1` first-token path | Rejected. New TP8 NCCL and PPLX matched each other (`/tmp/kimi_nccl_tp8_single_prefill_batch_o2_o5.json` vs `/tmp/kimi_pplx_tp8_single_prefill_batch_o2_o5.json`: 0 mismatches), but both changed `32/64` per-index traces compared with the C1 TP8 NCCL ground truth `/tmp/kimi_nccl_tp8_active64_o5_final.json`. Hash counter changed from `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` to `48x 9eecc1ca6fb3409d`, `16x f45b2f0248e7059d`; this is not correctness-preserving. |
 | 2026-05-25 | Run the exact prompt_len=1 fast prefill path with microbatch `2` or larger | Rejected for now. The full-batch probe `/tmp/kimi_nccl_tp8_c1batch_o5.json` produced `42/64` mismatches and hash counter `40x 7c4c5d83355198fd`, `18x f45b2f0248e7059d`, `6x 9eecc1ca6fb3409d`. A block-size-8 A/B still failed (`/tmp/kimi_nccl_tp8_c1batch_block8_o5.json`). The sweep showed bs2 correct in isolation (`/tmp/kimi_nccl_tp8_c1batch_bs2_o5.json`) but bs4+ drifted, and the scheduler microbatch=2 candidate `/tmp/kimi_nccl_tp8_c1micro2_o5.json` still had `37/64` mismatches. The accepted O2 path therefore keeps `KIMI_PROMPT_LEN1_PREFILL_MICROBATCH=1` until seq_len>1 layer parity is proven. |
+| 2026-05-25 | Opportunistically coalesce multiple `EngineCoreOutputs` in `pegainfer-vllm-frontend` before msgpack/ZMQ send | Rejected after service pressure test. The protocol can carry many `EngineCoreOutput` values per message, and the candidate preserved request order/final outputs in unit tests, but the canonical bs64 service result regressed from O3 `492.34 tok/s` to `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o4_output_coalesce_candidate.json` output `487.70 tok/s`, TPOT p50/p95/p99 `122.29/126.70/127.57ms`. This indicates the remaining service gap is not dominated by one-msgpack-per-token-output framing. |

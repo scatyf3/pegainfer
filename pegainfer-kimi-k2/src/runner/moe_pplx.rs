@@ -155,7 +155,9 @@ pub(super) fn forward_moe_layer_decode_pplx(
     let seq_len = scratch.mla.hidden.seq_len;
     let stream_raw = ctx.stream.cu_stream() as u64;
 
-    // Shared expert (main stream) + RMS norm
+    // Shared expert (main stream) + router (aux stream) both consume the
+    // post-attention normed hidden state, so start router as soon as norm is
+    // ready instead of waiting for shared expert/all-reduce to finish.
     typed_ops::rms_norm_into(
         ctx,
         &scratch.mla.hidden,
@@ -164,31 +166,6 @@ pub(super) fn forward_moe_layer_decode_pplx(
         &mut scratch.mla.normed,
     )?;
 
-    typed_ops::gemm_dm_typed_to_hs_graphsafe(
-        ctx,
-        &moe.shared_gate_up_proj,
-        &scratch.mla.normed,
-        &mut scratch.shared_expert.gate_up,
-    )?;
-    typed_ops::silu_mul_hs_fused_into(
-        ctx,
-        &scratch.shared_expert.gate_up,
-        &mut scratch.shared_expert.activated,
-    )?;
-    typed_ops::gemm_dm_hs_to_typed_graphsafe(
-        ctx,
-        &moe.shared_down_proj,
-        &scratch.shared_expert.activated,
-        &mut scratch.mla.projected,
-    )?;
-    super::worker::maybe_all_reduce_hidden_via_f32_in_place(
-        ctx,
-        &mut scratch.mla.projected,
-        &mut scratch.comm.hidden_allreduce_f32,
-        comm,
-    )?;
-
-    // ---- 3. Router on aux stream (overlap with shared expert) ----
     let norm_ready = ctx
         .stream
         .record_event(None)
@@ -226,6 +203,31 @@ pub(super) fn forward_moe_layer_decode_pplx(
         .stream
         .record_event(None)
         .with_context(|| format!("Kimi MoE PPLX layer {layer_idx} record route_ready"))?;
+
+    typed_ops::gemm_dm_typed_to_hs_graphsafe(
+        ctx,
+        &moe.shared_gate_up_proj,
+        &scratch.mla.normed,
+        &mut scratch.shared_expert.gate_up,
+    )?;
+    typed_ops::silu_mul_hs_fused_into(
+        ctx,
+        &scratch.shared_expert.gate_up,
+        &mut scratch.shared_expert.activated,
+    )?;
+    typed_ops::gemm_dm_hs_to_typed_graphsafe(
+        ctx,
+        &moe.shared_down_proj,
+        &scratch.shared_expert.activated,
+        &mut scratch.mla.projected,
+    )?;
+    super::worker::maybe_all_reduce_hidden_via_f32_in_place(
+        ctx,
+        &mut scratch.mla.projected,
+        &mut scratch.comm.hidden_allreduce_f32,
+        comm,
+    )?;
+
     ctx.stream
         .wait(&route_ready)
         .with_context(|| format!("Kimi MoE PPLX layer {layer_idx} main wait route_ready"))?;
