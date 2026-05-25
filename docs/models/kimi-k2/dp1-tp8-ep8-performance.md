@@ -177,6 +177,27 @@ PEGAINFER_KIMI_PARALLEL=tp8dp1 \
   request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1
 ```
 
+For math-kernel changes, also run the stronger output128 in-process trace
+comparison. The output5 probe catches early PPLX/NCCL path drift, but R5 showed
+router GEMM precision changes can pass output5 and diverge later.
+
+```bash
+cd /root/develop/xingming/pegainfer
+COMMIT=$(git rev-parse --short HEAD)
+CUDA_HOME=/usr/local/cuda \
+NVCC=/usr/local/cuda/bin/nvcc \
+LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_KIMI_PARALLEL=tp8dp1 \
+/root/.cargo/bin/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
+  --model-path /data/models/Kimi-K2.5 \
+  --cuda-graph true \
+  --format json \
+  --out /tmp/kimi_pplx_tp8_math_correctness_bs64_o128_${COMMIT}.json \
+  request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
+```
+
 ## Optimization Ledger
 
 | ID | Date | Commit | Area | Change | Correctness gate | bs64 result | Decision |
@@ -995,6 +1016,110 @@ only showed a `~0.20ms` local-compute microbench gain, so writing a bespoke
 bit-exact fused kernel is not justified before higher-share compute operators
 such as router and Marlin are addressed.
 
+## R5: Router GEMM cuBLAS Compute Mode
+
+### Profile
+
+Static bs64/kv128 model report identified the largest local-compute call sites:
+
+```text
+/tmp/kimi_fusion_model_report_static_bs64_kv128_o7_baseline.json
+```
+
+Top call sites:
+
+- `layer.*.moe.marlin_w13`: `127.33ms`, `48.60%`.
+- `layer.*.moe.marlin_w2`: `67.98ms`, `25.94%`.
+- `layer.*.moe.router`: `45.84ms`, `17.50%`, per call `764.052us`.
+
+A short static nsys report split the router body:
+
+```text
+/tmp/kimi-profile/26ec1e7-compute-static-report/static_bs64_kv128.nsys-rep
+/tmp/kimi-profile/26ec1e7-compute-static-report/cuda_gpu_kern_sum_cuda_gpu_kern_sum.txt
+```
+
+Router internals from the nsys kernel summary:
+
+- Router GEMM (`magma_sgemmEx_kernel`): `7` instances, avg `762.32us`.
+- `router_topk_normalize_kernel`: `7` instances, avg `8.35us`.
+- `router_scores_kernel`: `7` instances, avg `1.98us`.
+
+### Motivation / Expected Gain
+
+Router post-processing is not the bottleneck; the BF16 router GEMM dominates.
+The current code uses `CUBLAS_COMPUTE_32F_PEDANTIC`. Two temporary candidates
+were measured:
+
+- `CUBLAS_COMPUTE_32F_FAST_16BF`
+- `CUBLAS_COMPUTE_32F`
+
+The expected benefit was large because replacing the pedantic GEMM path could
+remove most of the `45.84ms` local-compute router slice.
+
+### Microbench
+
+Candidate static reports:
+
+```text
+/tmp/kimi_router_fast16bf_model_report_static_bs64_kv128.json
+/tmp/kimi_router_compute32f_model_report_static_bs64_kv128.json
+```
+
+Measured results:
+
+- Baseline `kimi_router_noaux_tc`: `60` calls, total `45843.120us`, per call
+  `764.052us`.
+- `FAST_16BF`: `60` calls, total `1785.480us`, per call `29.758us`.
+- `COMPUTE_32F`: `60` calls, total `1817.280us`, per call `30.288us`.
+- Static local-compute total moved from `262.005ms` to about `218.0ms`.
+
+### Correctness / Performance Gates
+
+Short output5 TP8 PPLX gate passed for `FAST_16BF`:
+
+```text
+/tmp/kimi_pplx_tp8_router_fast16bf_short.json
+old Counter({'7c4c5d83355198fd': 32, '9eecc1ca6fb3409d': 32})
+new Counter({'7c4c5d83355198fd': 32, '9eecc1ca6fb3409d': 32})
+mismatches 0
+```
+
+The stronger output128 in-process gate failed against the O7 baseline:
+
+```text
+/tmp/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json
+/tmp/kimi_router_fast16bf_micro_bs64_o128_warm1.json
+/tmp/kimi_router_compute32f_micro_bs64_o128_warm1.json
+```
+
+`FAST_16BF` output128:
+
+```text
+base Counter({'82a791616c737442': 32, '4ae8834e96c7d195': 16, '24b2b3856ac0ea3a': 16})
+new Counter({'4ae8834e96c7d195': 32, 'f8484b874a3f0572': 16, '82a791616c737442': 16})
+mismatches 32
+steady TPOT p50/p95/p99 43.996/44.869/46.312ms
+```
+
+`COMPUTE_32F` output128:
+
+```text
+base Counter({'82a791616c737442': 32, '4ae8834e96c7d195': 16, '24b2b3856ac0ea3a': 16})
+new Counter({'4ae8834e96c7d195': 32, 'f8484b874a3f0572': 16, '82a791616c737442': 16})
+mismatches 32
+steady TPOT p50/p95/p99 44.266/45.709/48.028ms
+```
+
+### Decision
+
+Reject and revert both compute-mode variants. The performance win is large, but
+the long token trace changes after the short output5 gate. This is an important
+profile result: router GEMM is a real bs64 bottleneck, but changing cuBLAS
+compute mode is not precision-preserving under the current baseline. A future
+router optimization needs either a bit-equivalent faster GEMM path or a stronger
+model-level reference that explicitly accepts this numerical boundary change.
+
 ## Candidate Queue
 
 | Priority | Area | Hypothesis | Correctness risk |
@@ -1017,3 +1142,4 @@ such as router and Marlin are addressed.
 | 2026-05-25 | Opportunistically coalesce multiple `EngineCoreOutputs` in `pegainfer-vllm-frontend` before msgpack/ZMQ send | Rejected after service pressure test. The protocol can carry many `EngineCoreOutput` values per message, and the candidate preserved request order/final outputs in unit tests, but the canonical bs64 service result regressed from O3 `492.34 tok/s` to `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o4_output_coalesce_candidate.json` output `487.70 tok/s`, TPOT p50/p95/p99 `122.29/126.70/127.57ms`. This indicates the remaining service gap is not dominated by one-msgpack-per-token-output framing. |
 | 2026-05-25 | Move the full routed expert/PPLX decode path to the aux stream after router | Rejected after correctness and microbench. The candidate preserved TP8 NCCL/PPLX short-token trace (`/tmp/kimi_pplx_tp8_o6_aux_routed_short.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches), but regressed the bs64/o128 in-process probe from O5 `582.89 tok/s`, TPOT p50/p95/p99 `102.84/104.09/105.48ms` to `/tmp/kimi_pplx_tp8_o6_aux_routed_micro_bs64_o128_warm1.json` `580.65 tok/s`, TPOT p50/p95/p99 `103.21/104.60/106.05ms`; service pressure was skipped because the lower-level gate already lost. |
 | 2026-05-25 | Fuse attention residual add with post-attention RMSNorm using the existing FlashInfer fused add+rmsnorm adapter | Rejected after microbench and correctness. Static bs64/kv128 operator reports changed the targeted local-compute slice from about `2932us` to `2735us`, only `~0.20ms` per rank, and `/tmp/kimi_pplx_tp8_fused_addrms_short.json` mismatched `/tmp/kimi_nccl_tp8_active64_o5_final.json` on `32/64` generated-token traces. The likely issue is different BF16 materialization/rounding than the current `add_batch` then `rms_norm_batch` sequence. |
+| 2026-05-25 | Change router GEMM from `CUBLAS_COMPUTE_32F_PEDANTIC` to `FAST_16BF` or `COMPUTE_32F` | Rejected after a stronger output128 correctness gate. Static microbench improved router from `764us` to about `30us` per MoE layer and in-process TPOT p50 improved to `~44ms`, but both variants changed `32/64` output128 token traces versus `/tmp/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json`. The short output5 gate was too weak to catch this drift. |
