@@ -542,7 +542,7 @@ fn send_rejection(req: &PendingRequest, reason: RejectReason) {
             req.max_tokens
         ),
         RejectReason::KvBudget => format!(
-            "request requires more KV blocks than this model instance can provide: prompt_tokens={}, max_context_tokens={}",
+            "request requires more KV blocks than this model instance can provide: prompt_tokens={}, max_request_tokens={}",
             req.prompt_tokens.len(),
             max_request_tokens(req)
         ),
