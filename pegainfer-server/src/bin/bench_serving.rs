@@ -13,6 +13,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{IsTerminal, stdout};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -96,6 +98,13 @@ const COMPARE_EXAMPLES: &str = "\
 Examples:
   cargo run -r --bin bench_serving -- compare bench_snapshots/rtx-5070-ti/qwen3-4b.json
   cargo run -r --bin bench_serving -- compare bench_snapshots/rtx-5070-ti/qwen3-4b.json --baseline HEAD~3";
+const MIXED_EXAMPLES: &str = "\
+Examples:
+  cargo run -r --bin bench_serving -- mixed
+  cargo run -r --bin bench_serving -- mixed --bg-concurrency 8 --qps 0.5 --num-injections 10
+  cargo run -r --bin bench_serving -- mixed --bg-concurrency 2 --bg-output-len 512 \\
+    --inj-prompt-len 4000 --qps 1.0 --num-injections 3 --warmup 2
+  cargo run -r --bin bench_serving -- --format json --out mixed.json mixed --skip-baseline";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
@@ -136,6 +145,9 @@ enum Command {
     /// Compare a snapshot against its git baseline.
     #[command(after_help = COMPARE_EXAMPLES)]
     Compare(CompareArgs),
+    /// Measure decode ITL while long prompts arrive at low QPS (mixed load).
+    #[command(after_help = MIXED_EXAMPLES)]
+    Mixed(MixedArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -287,6 +299,56 @@ struct CompareArgs {
     baseline: String,
 }
 
+#[derive(Debug, ClapArgs)]
+struct MixedArgs {
+    /// Prompt length of each background decode stream (decode-heavy steady state)
+    #[arg(long, default_value_t = 1024)]
+    bg_prompt_len: usize,
+
+    /// Number of long-lived background decode streams kept active for the run
+    #[arg(long, default_value_t = 8)]
+    bg_concurrency: usize,
+
+    /// Max generated tokens per background stream (size to outlast the whole run)
+    #[arg(long, default_value_t = 8192)]
+    bg_output_len: usize,
+
+    /// Prompt length of each injected long prompt (the prefill that stalls decode)
+    #[arg(long, default_value_t = 10_000)]
+    inj_prompt_len: usize,
+
+    /// Max generated tokens per injected prompt (1 = prefill-dominated)
+    #[arg(long, default_value_t = 1)]
+    inj_output_len: usize,
+
+    /// Arrival rate of injected long prompts, in requests per second
+    #[arg(long, default_value_t = 0.5)]
+    qps: f64,
+
+    /// Number of long prompts to inject; bounds the run length
+    #[arg(long, default_value_t = 10)]
+    num_injections: usize,
+
+    /// Skip the decode-only baseline control (only measure the mixed run)
+    #[arg(long, default_value_t = false)]
+    skip_baseline: bool,
+
+    /// Fraction of injections that reuse a shared prompt and so hit the prefix
+    /// cache (warm prefill, ~no stall); the rest get distinct prompts (cold,
+    /// worst-case stall). 0.0 = all cold (default), 1.0 = all warm, 0.5 = half.
+    /// Warm/cold are interleaved evenly across the run.
+    #[arg(long, default_value_t = 0.0)]
+    inj_warm_frac: f64,
+
+    /// Background tokens each stream must emit before injection starts (head-start)
+    #[arg(long, default_value_t = 8)]
+    head_start_tokens: usize,
+
+    /// `--iters` is ignored by `mixed`; `--warmup`/`--seed` apply.
+    #[command(flatten)]
+    run: RunArgs,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct RunInfo {
     command: &'static str,
@@ -346,7 +408,7 @@ struct RequestMetrics {
     steady_tpot_ms: Option<DurationStats>,
     e2e_ms: DurationStats,
     generated_tokens: CountStats,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     generated_token_traces: Vec<GeneratedTokenTrace>,
     request_tok_s: Option<f64>,
     decode_tok_s: Option<f64>,
@@ -380,8 +442,80 @@ struct SnapshotReport {
     /// Absent in snapshots that predate multi-GPU model lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parallel: Option<String>,
+    /// Cold prefill: a distinct prompt per iteration so the prefix cache never
+    /// hits — measures real prefill compute (the TTFT regression gate).
     prefill_heavy: SnapshotProfile,
+    /// Warm prefill: the same prompt every iteration, so iterations after the
+    /// first hit the default-on prefix cache (#216) — what a repeated prompt
+    /// actually costs. `Option` so pre-existing baselines (without this field)
+    /// still deserialize for `compare`.
+    #[serde(default)]
+    prefill_cached: Option<SnapshotProfile>,
     decode_heavy: SnapshotProfile,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MixedLoadConfig {
+    bg_prompt_len: usize,
+    bg_concurrency: usize,
+    bg_output_len: usize,
+    inj_prompt_len: usize,
+    inj_output_len: usize,
+    qps: f64,
+    num_injections: usize,
+    inj_warm_frac: f64,
+    warmup: usize,
+    seed: u64,
+}
+
+/// Inter-token-latency of the background decode streams
+#[derive(Debug, Clone, Serialize)]
+struct MixedLoadItl {
+    /// Every background decode gap.
+    all: DurationStats,
+    /// Gaps with no overlapping injection window (decode unaffected by prefill).
+    steady: Option<DurationStats>,
+    /// Gaps overlapping an in-flight prefill (the unified-step stall tail).
+    stall: Option<DurationStats>,
+    stall_gap_count: usize,
+    total_gap_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InjectionRecord {
+    index: usize,
+    /// Whether this injection reused the shared prompt (intended prefix-cache hit).
+    warm: bool,
+    /// Wall time from submit to last token of the injected prompt (≈ prefill time).
+    prefill_ms: f64,
+    /// Offset of this injection's submit from the first injection's submit.
+    arrival_offset_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MixedDecisionInputs {
+    baseline_p50_ms: Option<f64>,
+    baseline_p99_ms: Option<f64>,
+    mixed_p50_ms: f64,
+    mixed_p99_ms: f64,
+    p99_delta_ms: Option<f64>,
+    p99_delta_pct: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MixedLoadReport {
+    commit: String,
+    date: String,
+    gpu: String,
+    run: RunInfo,
+    config: MixedLoadConfig,
+    /// Decode-only control (None when --skip-baseline).
+    baseline_itl: Option<DurationStats>,
+    mixed_itl: MixedLoadItl,
+    injections: Vec<InjectionRecord>,
+    decision_inputs: MixedDecisionInputs,
+    /// Non-fatal measurement caveats (e.g. a background stream finished early).
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -453,6 +587,7 @@ enum BenchReport {
     Request(Box<RequestReport>),
     Matrix(MatrixReport),
     Curve(CurveReport),
+    Mixed(Box<MixedLoadReport>),
 }
 
 fn dur_ms(d: Duration) -> f64 {
@@ -846,6 +981,17 @@ fn synthetic_random_prompt(len: usize, seed: u64, request_idx: usize) -> Vec<u32
         .collect()
 }
 
+/// To control prefix cache hit/miss in mixed-load benchmarking, we salt the
+/// synthetic prompt tokens by a large constant per injection, so that even the
+/// same prompt length gets a different token sequence and so misses the prefix
+/// cache when intended (e.g. `--inj-warm-frac 0.0`).
+fn synthetic_prompt_tokens_salted(len: usize, salt: usize) -> Vec<u32> {
+    let shift = salt.wrapping_mul(7919);
+    (0..len)
+        .map(|i| (((i + shift) % 1000) + 100) as u32)
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct PromptSpec {
     descriptor: PromptDescriptor,
@@ -935,6 +1081,11 @@ trait BenchModel {
         Ok(())
     }
 
+    /// Scheduler handle for open-loop mixed-load benchmarking.
+    fn scheduler_handle(&self) -> Option<SchedulerHandle> {
+        None
+    }
+
     fn timed_generation(
         &mut self,
         prompt_tokens: &[u32],
@@ -1005,6 +1156,10 @@ struct SchedulerBenchModel {
 }
 
 impl BenchModel for SchedulerBenchModel {
+    fn scheduler_handle(&self) -> Option<SchedulerHandle> {
+        Some(self.handle.clone())
+    }
+
     fn timed_generation(
         &mut self,
         prompt_tokens: &[u32],
@@ -1340,6 +1495,7 @@ fn command_seed(cli: &Cli) -> u64 {
         Command::Matrix(args) => args.run.seed,
         Command::Curve(args) => args.run.seed,
         Command::Snapshot(args) => args.run.seed,
+        Command::Mixed(args) => args.run.seed,
         Command::Compare(_) => 42,
     }
 }
@@ -1404,6 +1560,489 @@ fn measure_timings(
     }
     drop(profiler);
     Ok(timings)
+}
+
+// ---------------------------------------------------------------------------
+// Mixed-load ITL (open-loop: decode-heavy background + low-QPS long prefills)
+// ---------------------------------------------------------------------------
+
+/// One background decode stream's record over a mixed-load (or baseline) phase.
+struct BgStream {
+    /// Wall-clock instant of each emitted decode token.
+    token_times: Vec<Instant>,
+    /// True if the stream hit its `output_len` (Finished) before being stopped —
+    /// signals that steady-state concurrency dropped mid-run.
+    finished_early: bool,
+}
+
+struct InjectorOutcome {
+    /// `[submit, last-token]` window of each injected prefill.
+    windows: Vec<(Instant, Instant)>,
+    records: Vec<InjectionRecord>,
+    /// Injections whose prefill outlasted the `1/qps` slot (QPS not sustained).
+    overruns: usize,
+}
+
+fn greedy_sampling() -> SamplingParams {
+    SamplingParams {
+        ignore_eos: true,
+        ..SamplingParams::default()
+    }
+}
+
+fn opt_summarize(samples: &[Duration]) -> Option<DurationStats> {
+    (!samples.is_empty()).then(|| summarize_durations(samples))
+}
+
+/// Spawn `bg_concurrency` long-lived decode streams. Each records the instant of
+/// every emitted token and stops when `stop` is set (or its `output_len` runs
+/// out). `counters[idx]` tracks tokens emitted, for head-start coordination.
+fn spawn_background_streams(
+    handle: &SchedulerHandle,
+    bg_prompt_len: usize,
+    bg_output_len: usize,
+    bg_concurrency: usize,
+    stop: &Arc<AtomicBool>,
+    counters: &Arc<[AtomicUsize]>,
+) -> Vec<thread::JoinHandle<Result<BgStream>>> {
+    (0..bg_concurrency)
+        .map(|idx| {
+            let handle = handle.clone();
+            let stop = Arc::clone(stop);
+            let counters = Arc::clone(counters);
+            thread::spawn(move || -> Result<BgStream> {
+                let prompt = synthetic_prompt_tokens(bg_prompt_len);
+                let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+                handle
+                    .submit(SchedulerRequest {
+                        request_id: Some(format!("mixed-bg-{idx}")),
+                        queued_at_unix_s: None,
+                        prompt_tokens: prompt,
+                        params: greedy_sampling(),
+                        max_tokens: bg_output_len,
+                        lora_adapter: None,
+                        token_tx,
+                        logprobs: 0,
+                        echo: false,
+                    })
+                    .map_err(|e| anyhow::anyhow!("background submit failed: {e}"))?;
+
+                let mut token_times = Vec::with_capacity(bg_output_len);
+                let mut finished_early = false;
+                loop {
+                    match token_rx.blocking_recv() {
+                        Some(TokenEvent::Token { .. }) => {
+                            token_times.push(Instant::now());
+                            counters[idx].fetch_add(1, Ordering::Relaxed);
+                            if stop.load(Ordering::Acquire) {
+                                break;
+                            }
+                        }
+                        Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
+                        Some(TokenEvent::Finished { .. }) => {
+                            finished_early = true;
+                            break;
+                        }
+                        Some(TokenEvent::Error { message, .. }) => {
+                            anyhow::bail!("background request failed: {message}");
+                        }
+                        Some(TokenEvent::Rejected { message, .. }) => {
+                            anyhow::bail!("background request rejected: {message}");
+                        }
+                        None => anyhow::bail!("background channel closed"),
+                    }
+                }
+                // Dropping `token_rx` cancels the request if it is still active.
+                Ok(BgStream {
+                    token_times,
+                    finished_early,
+                })
+            })
+        })
+        .collect()
+}
+
+/// Run a few closed-loop decode batches at the target concurrency to JIT the
+/// decode CUDA graph and warm the allocator before measurement begins.
+fn mixed_warmup(
+    handle: &SchedulerHandle,
+    bg_prompt_len: usize,
+    bg_concurrency: usize,
+    rounds: usize,
+) -> Result<()> {
+    for _ in 0..rounds {
+        let workers: Vec<_> = (0..bg_concurrency)
+            .map(|idx| {
+                let handle = handle.clone();
+                thread::spawn(move || -> Result<()> {
+                    let prompt = synthetic_prompt_tokens(bg_prompt_len);
+                    let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+                    handle
+                        .submit(SchedulerRequest {
+                            request_id: Some(format!("mixed-warmup-{idx}")),
+                            queued_at_unix_s: None,
+                            prompt_tokens: prompt,
+                            params: greedy_sampling(),
+                            max_tokens: 16,
+                            lora_adapter: None,
+                            token_tx,
+                            logprobs: 0,
+                            echo: false,
+                        })
+                        .map_err(|e| anyhow::anyhow!("warmup submit failed: {e}"))?;
+                    loop {
+                        match token_rx.blocking_recv() {
+                            Some(TokenEvent::Finished { .. }) => break,
+                            Some(TokenEvent::Error { message, .. }) => {
+                                anyhow::bail!("warmup request failed: {message}")
+                            }
+                            Some(TokenEvent::Rejected { message, .. }) => {
+                                anyhow::bail!("warmup request rejected: {message}")
+                            }
+                            Some(_) => {}
+                            None => anyhow::bail!("warmup channel closed"),
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("warmup worker panicked")?;
+        }
+    }
+    Ok(())
+}
+
+/// Block until every background stream has emitted `target` tokens, so injection
+/// starts only after the background is in steady-state decode (past its own
+/// prefill / first-decode-step). Returns false on timeout.
+fn wait_for_head_start(counters: &Arc<[AtomicUsize]>, target: usize, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if counters.iter().all(|c| c.load(Ordering::Relaxed) >= target) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Decide whether injection `index` is warm, spreading `warm_frac` of injections
+/// evenly across the run (Bresenham-style, so e.g. 0.5 → every other injection).
+fn injection_is_warm(index: usize, warm_frac: f64) -> bool {
+    let count = |k: usize| (k as f64 * warm_frac).floor() as usize;
+    count(index + 1) > count(index)
+}
+
+/// Submit `num_injections` long prompts paced by arrival at `qps`, draining each
+/// to completion. Each `[submit, last-token]` window marks an in-flight prefill.
+fn run_injector(
+    handle: &SchedulerHandle,
+    inj_prompt_len: usize,
+    inj_output_len: usize,
+    qps: f64,
+    num_injections: usize,
+    warm_frac: f64,
+) -> Result<InjectorOutcome> {
+    let period = Duration::from_secs_f64(1.0 / qps);
+    let mut windows = Vec::with_capacity(num_injections);
+    let mut records = Vec::with_capacity(num_injections);
+    let mut overruns = 0usize;
+    // Reserved salt for warm injections: shared (so they hit each other) and
+    // distinct from every cold salt (1..=num_injections) and from salt 0 (the
+    // background prompt) so no accidental cross-prefix hit.
+    let warm_salt = num_injections + 100;
+    let t0 = Instant::now();
+    for index in 0..num_injections {
+        // Evenly interleave round(warm_frac * num_injections) warm injections.
+        let warm = injection_is_warm(index, warm_frac);
+        // Warm → shared prompt (injection after the first hits the prefix cache).
+        // Cold → distinct prompt per injection → real prefill every time.
+        let salt = if warm { warm_salt } else { index + 1 };
+        let prompt = synthetic_prompt_tokens_salted(inj_prompt_len, salt);
+        let slot_start = Instant::now();
+        let (token_tx, mut token_rx) = mpsc::unbounded_channel();
+        handle
+            .submit(SchedulerRequest {
+                request_id: Some(format!("mixed-inj-{index}")),
+                queued_at_unix_s: None,
+                prompt_tokens: prompt,
+                params: greedy_sampling(),
+                max_tokens: inj_output_len,
+                lora_adapter: None,
+                token_tx,
+                logprobs: 0,
+                echo: false,
+            })
+            .map_err(|e| anyhow::anyhow!("injection submit failed: {e}"))?;
+        let mut last = slot_start;
+        loop {
+            match token_rx.blocking_recv() {
+                Some(TokenEvent::Token { .. }) => last = Instant::now(),
+                Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
+                Some(TokenEvent::Finished { .. }) => break,
+                Some(TokenEvent::Error { message, .. }) => {
+                    anyhow::bail!("injection request failed: {message}")
+                }
+                Some(TokenEvent::Rejected { message, .. }) => {
+                    anyhow::bail!("injection request rejected: {message}")
+                }
+                None => anyhow::bail!("injection channel closed"),
+            }
+        }
+        windows.push((slot_start, last));
+        records.push(InjectionRecord {
+            index,
+            warm,
+            prefill_ms: dur_ms(last - slot_start),
+            arrival_offset_ms: dur_ms(slot_start - t0),
+        });
+        let elapsed = slot_start.elapsed();
+        if elapsed < period {
+            thread::sleep(period.saturating_sub(elapsed));
+        } else if index + 1 < num_injections {
+            overruns += 1;
+        }
+    }
+    Ok(InjectorOutcome {
+        windows,
+        records,
+        overruns,
+    })
+}
+
+/// A background decode gap `[a, b)` is a stall if it overlaps any in-flight
+/// prefill window `[s, e)`.
+fn gap_overlaps_any(a: Instant, b: Instant, windows: &[(Instant, Instant)]) -> bool {
+    windows.iter().any(|&(s, e)| a < e && s < b)
+}
+
+fn collect_gaps(streams: &[BgStream]) -> Vec<Duration> {
+    let mut gaps = Vec::new();
+    for stream in streams {
+        for pair in stream.token_times.windows(2) {
+            gaps.push(pair[1] - pair[0]);
+        }
+    }
+    gaps
+}
+
+fn build_mixed_itl(streams: &[BgStream], windows: &[(Instant, Instant)]) -> Option<MixedLoadItl> {
+    let mut all = Vec::new();
+    let mut steady = Vec::new();
+    let mut stall = Vec::new();
+    for stream in streams {
+        for pair in stream.token_times.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            all.push(b - a);
+            if gap_overlaps_any(a, b, windows) {
+                stall.push(b - a);
+            } else {
+                steady.push(b - a);
+            }
+        }
+    }
+    let total_gap_count = all.len();
+    let stall_gap_count = stall.len();
+    Some(MixedLoadItl {
+        all: opt_summarize(&all)?,
+        steady: opt_summarize(&steady),
+        stall: opt_summarize(&stall),
+        stall_gap_count,
+        total_gap_count,
+    })
+}
+
+/// Decode-only control: same background streams, no injector, run for `duration`.
+fn run_baseline(
+    handle: &SchedulerHandle,
+    args: &MixedArgs,
+    duration: Duration,
+    warnings: &mut Vec<String>,
+) -> Result<Option<DurationStats>> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let counters: Arc<[AtomicUsize]> = (0..args.bg_concurrency)
+        .map(|_| AtomicUsize::new(0))
+        .collect();
+    let bg_handles = spawn_background_streams(
+        handle,
+        args.bg_prompt_len,
+        args.bg_output_len,
+        args.bg_concurrency,
+        &stop,
+        &counters,
+    );
+    if !wait_for_head_start(&counters, args.head_start_tokens, Duration::from_secs(120)) {
+        warnings.push("baseline: head-start not reached within 120s".to_string());
+    }
+    thread::sleep(duration);
+    stop.store(true, Ordering::Release);
+
+    let mut streams = Vec::with_capacity(args.bg_concurrency);
+    for worker in bg_handles {
+        streams.push(worker.join().expect("baseline worker panicked")?);
+    }
+    if streams.iter().any(|s| s.finished_early) {
+        warnings.push(
+            "baseline: a background stream hit --bg-output-len before the window closed"
+                .to_string(),
+        );
+    }
+    Ok(opt_summarize(&collect_gaps(&streams)))
+}
+
+fn run_mixed_load(
+    model: &mut dyn BenchModel,
+    cli: &Cli,
+    model_type: ModelType,
+    load_ms: f64,
+    cuda_graph: bool,
+    args: &MixedArgs,
+) -> Result<BenchReport> {
+    ensure!(args.bg_concurrency > 0, "--bg-concurrency must be > 0");
+    ensure!(args.bg_prompt_len > 0, "--bg-prompt-len must be > 0");
+    ensure!(args.bg_output_len > 0, "--bg-output-len must be > 0");
+    ensure!(args.inj_prompt_len > 0, "--inj-prompt-len must be > 0");
+    ensure!(args.inj_output_len > 0, "--inj-output-len must be > 0");
+    ensure!(args.num_injections > 0, "--num-injections must be > 0");
+    ensure!(args.qps > 0.0, "--qps must be > 0");
+    ensure!(
+        (0.0..=1.0).contains(&args.inj_warm_frac),
+        "--inj-warm-frac must be in [0.0, 1.0]"
+    );
+
+    let handle = model.scheduler_handle().context(
+        "mixed-load requires a scheduler-backed continuous-batching model; \
+         this model exposes no scheduler handle",
+    )?;
+
+    let mut warnings = Vec::new();
+
+    info!(
+        "mixed-load warmup: {} round(s) at bg_concurrency={}",
+        args.run.warmup, args.bg_concurrency
+    );
+    mixed_warmup(
+        &handle,
+        args.bg_prompt_len,
+        args.bg_concurrency,
+        args.run.warmup,
+    )?;
+
+    // ---- Mixed phase ----
+    info!(
+        "mixed-load: {} background decode streams (prompt={}, output={}); injecting {} prompt(s) of {} tokens at {} QPS",
+        args.bg_concurrency,
+        args.bg_prompt_len,
+        args.bg_output_len,
+        args.num_injections,
+        args.inj_prompt_len,
+        args.qps
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let counters: Arc<[AtomicUsize]> = (0..args.bg_concurrency)
+        .map(|_| AtomicUsize::new(0))
+        .collect();
+    let bg_handles = spawn_background_streams(
+        &handle,
+        args.bg_prompt_len,
+        args.bg_output_len,
+        args.bg_concurrency,
+        &stop,
+        &counters,
+    );
+    if !wait_for_head_start(&counters, args.head_start_tokens, Duration::from_secs(120)) {
+        warnings.push(format!(
+            "head-start of {} tokens not reached within 120s; injection started anyway",
+            args.head_start_tokens
+        ));
+    }
+
+    let mixed_window_start = Instant::now();
+    let inj = run_injector(
+        &handle,
+        args.inj_prompt_len,
+        args.inj_output_len,
+        args.qps,
+        args.num_injections,
+        args.inj_warm_frac,
+    )?;
+    stop.store(true, Ordering::Release);
+    let mixed_window = mixed_window_start.elapsed();
+
+    let mut streams = Vec::with_capacity(args.bg_concurrency);
+    for worker in bg_handles {
+        streams.push(worker.join().expect("background worker panicked")?);
+    }
+
+    if inj.overruns > 0 {
+        warnings.push(format!(
+            "{} injection(s) overran the {:.0}ms QPS slot (prefill longer than 1/qps); arrivals were not evenly paced",
+            inj.overruns,
+            1000.0 / args.qps
+        ));
+    }
+    let early = streams.iter().filter(|s| s.finished_early).count();
+    if early > 0 {
+        warnings.push(format!(
+            "{early} background stream(s) hit --bg-output-len before the run ended; raise --bg-output-len to keep steady-state concurrency constant"
+        ));
+    }
+
+    let mixed_itl = build_mixed_itl(&streams, &inj.windows).context(
+        "no background decode gaps recorded; increase --bg-output-len or --num-injections",
+    )?;
+
+    // ---- Baseline phase (decode-only control over the same wall-clock) ----
+    let baseline_itl = if args.skip_baseline {
+        None
+    } else {
+        info!(
+            "mixed-load baseline: decode-only for {:.1}s",
+            mixed_window.as_secs_f64()
+        );
+        run_baseline(&handle, args, mixed_window, &mut warnings)?
+    };
+
+    let mixed_p50_ms = mixed_itl.all.p50_ms;
+    let mixed_p99_ms = mixed_itl.all.p99_ms;
+    let decision_inputs = MixedDecisionInputs {
+        baseline_p50_ms: baseline_itl.as_ref().map(|b| b.p50_ms),
+        baseline_p99_ms: baseline_itl.as_ref().map(|b| b.p99_ms),
+        mixed_p50_ms,
+        mixed_p99_ms,
+        p99_delta_ms: baseline_itl.as_ref().map(|b| mixed_p99_ms - b.p99_ms),
+        p99_delta_pct: baseline_itl
+            .as_ref()
+            .map(|b| delta_pct(mixed_p99_ms, b.p99_ms)),
+    };
+
+    Ok(BenchReport::Mixed(Box::new(MixedLoadReport {
+        commit: git_short_commit(),
+        date: today_date(),
+        gpu: gpu_name(),
+        run: run_info(cli, "mixed", model_type, load_ms, cuda_graph),
+        config: MixedLoadConfig {
+            bg_prompt_len: args.bg_prompt_len,
+            bg_concurrency: args.bg_concurrency,
+            bg_output_len: args.bg_output_len,
+            inj_prompt_len: args.inj_prompt_len,
+            inj_output_len: args.inj_output_len,
+            qps: args.qps,
+            num_injections: args.num_injections,
+            inj_warm_frac: args.inj_warm_frac,
+            warmup: args.run.warmup,
+            seed: args.run.seed,
+        },
+        baseline_itl,
+        mixed_itl,
+        injections: inj.records,
+        decision_inputs,
+        warnings,
+    })))
 }
 
 fn build_request_metrics(timings: &[GenTimings]) -> RequestMetrics {
@@ -1734,6 +2373,133 @@ fn render_text(report: &BenchReport) -> String {
             out.push('\n');
             push_table(&mut out, &render_curve_table(report));
         }
+        BenchReport::Mixed(report) => out.push_str(&render_mixed_text(report)),
+    }
+    out
+}
+
+fn render_mixed_text(report: &MixedLoadReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "bench_serving mixed-load ITL\n");
+
+    let cfg = &report.config;
+    let mut meta = render_run_summary(&report.run);
+    meta.add_row(vec![
+        key_cell("commit / gpu"),
+        value_cell(format!("{} / {}", report.commit, report.gpu)),
+    ]);
+    meta.add_row(vec![
+        key_cell("bg (prompt,conc,out)"),
+        value_cell(format!(
+            "({},{},{})",
+            cfg.bg_prompt_len, cfg.bg_concurrency, cfg.bg_output_len
+        )),
+    ]);
+    meta.add_row(vec![
+        key_cell("injection (prompt,out)"),
+        value_cell(format!(
+            "({},{})  warm_frac={}",
+            cfg.inj_prompt_len, cfg.inj_output_len, cfg.inj_warm_frac
+        )),
+    ]);
+    meta.add_row(vec![
+        key_cell("qps / num_injections"),
+        value_cell(format!("{} / {}", cfg.qps, cfg.num_injections)),
+    ]);
+    meta.add_row(vec![
+        key_cell("warmup / seed"),
+        value_cell(format!("{} / {}", cfg.warmup, cfg.seed)),
+    ]);
+    push_table(&mut out, &meta);
+    out.push('\n');
+
+    let mut rows = Vec::new();
+    if let Some(baseline) = &report.baseline_itl {
+        rows.push(("baseline_itl".to_string(), baseline.clone()));
+    }
+    rows.push(("mixed_itl_all".to_string(), report.mixed_itl.all.clone()));
+    if let Some(steady) = &report.mixed_itl.steady {
+        rows.push(("mixed_itl_steady".to_string(), steady.clone()));
+    }
+    if let Some(stall) = &report.mixed_itl.stall {
+        rows.push(("mixed_itl_stall".to_string(), stall.clone()));
+    }
+    push_table(&mut out, &render_duration_table(rows));
+    out.push('\n');
+
+    let total = report.mixed_itl.total_gap_count;
+    let stalled = report.mixed_itl.stall_gap_count;
+    let stall_pct = if total > 0 {
+        100.0 * stalled as f64 / total as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(out, "stall gaps: {stalled}/{total} ({stall_pct:.1}%)");
+
+    let dur = |ms: f64| Duration::from_secs_f64(ms / 1000.0);
+    let prefill_line = |label: &str, ms: &[Duration]| {
+        if ms.is_empty() {
+            return String::new();
+        }
+        let s = summarize_durations(ms);
+        format!(
+            "{label}: p50={:.2}ms  p99={:.2}ms  max={:.2}ms (n={})\n",
+            s.p50_ms,
+            s.p99_ms,
+            s.max_ms,
+            ms.len()
+        )
+    };
+    if !report.injections.is_empty() {
+        let cold: Vec<Duration> = report
+            .injections
+            .iter()
+            .filter(|r| !r.warm)
+            .map(|r| dur(r.prefill_ms))
+            .collect();
+        let warm: Vec<Duration> = report
+            .injections
+            .iter()
+            .filter(|r| r.warm)
+            .map(|r| dur(r.prefill_ms))
+            .collect();
+        out.push_str(&prefill_line("injected prefill (cold)", &cold));
+        out.push_str(&prefill_line("injected prefill (warm)", &warm));
+    }
+
+    let d = &report.decision_inputs;
+    match (
+        d.baseline_p50_ms,
+        d.baseline_p99_ms,
+        d.p99_delta_pct,
+        d.p99_delta_ms,
+    ) {
+        (Some(bp50), Some(bp99), Some(dpct), Some(dms)) => {
+            let _ = writeln!(
+                out,
+                "\nITL p50: baseline {:.2}ms → mixed {:.2}ms",
+                bp50, d.mixed_p50_ms
+            );
+            let _ = writeln!(
+                out,
+                "ITL p99: baseline {:.2}ms → mixed {:.2}ms ({}, {:+.2}ms)",
+                bp99,
+                d.mixed_p99_ms,
+                format_delta(dpct),
+                dms
+            );
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "\nITL (mixed, no baseline): p50={:.2}ms  p99={:.2}ms",
+                d.mixed_p50_ms, d.mixed_p99_ms
+            );
+        }
+    }
+
+    for warning in &report.warnings {
+        let _ = writeln!(out, "warning: {warning}");
     }
     out
 }
@@ -1769,6 +2535,7 @@ fn run_command(
         Command::Curve(args) => {
             bench_curve(model, tokenizer, cli, model_type, load_ms, cuda_graph, args)
         }
+        Command::Mixed(args) => run_mixed_load(model, cli, model_type, load_ms, cuda_graph, args),
         Command::Snapshot(_) | Command::Compare(_) => unreachable!(),
     }
 }
@@ -1851,6 +2618,51 @@ fn format_delta(pct: f64) -> String {
     }
 }
 
+/// Measure cold prefill TTFT: each iteration uses a distinct (salted) prompt so
+/// the default-on prefix cache never hits, isolating real prefill compute.
+/// Mirrors `measure_timings` but varies the prompt per iteration.
+fn measure_cold_prefill_timings(
+    model: &mut dyn BenchModel,
+    prompt_len: usize,
+    run: &RunArgs,
+) -> Result<Vec<GenTimings>> {
+    validate_run_args(run)?;
+    let sampling = greedy_sampling();
+    let mut rng = StdRng::seed_from_u64(run.seed);
+    // Warmup with distinct prompts (content only matters for JIT/allocator warmup).
+    for i in 0..run.warmup {
+        let toks = synthetic_prompt_tokens_salted(prompt_len, 100_000 + i);
+        let _ = model.timed_generation_batch(
+            std::slice::from_ref(&toks),
+            SNAPSHOT_PREFILL_OUTPUT_LEN,
+            &sampling,
+            &mut rng,
+        );
+    }
+    let mut timings = Vec::with_capacity(run.iters);
+    for i in 0..run.iters {
+        // salt 1.. keeps the first token distinct from the cached prompt (salt 0)
+        // and from every other iteration → guaranteed cache miss each time.
+        let toks = synthetic_prompt_tokens_salted(prompt_len, i + 1);
+        timings.extend(model.timed_generation_batch(
+            std::slice::from_ref(&toks),
+            SNAPSHOT_PREFILL_OUTPUT_LEN,
+            &sampling,
+            &mut rng,
+        ));
+    }
+    Ok(timings)
+}
+
+/// Trim a profile's per-iteration token traces down to a single determinism
+/// fingerprint. `compare` never reads the traces and (under greedy decode)
+/// repeated-prompt profiles emit identical copies, so keeping one hash keeps the
+/// committed snapshot small without losing the "did the output change" signal.
+fn snapshot_metrics(mut metrics: RequestMetrics) -> RequestMetrics {
+    metrics.generated_token_traces.truncate(1);
+    metrics
+}
+
 fn run_snapshot(
     model: &mut dyn BenchModel,
     cli: &Cli,
@@ -1859,16 +2671,22 @@ fn run_snapshot(
 ) -> Result<()> {
     let prefill_prompt_len = snapshot_prefill_prompt_len(model_type);
 
-    info!("Running prefill-heavy ({prefill_prompt_len},{SNAPSHOT_PREFILL_OUTPUT_LEN})");
-    let prefill_tokens = synthetic_prompt_tokens(prefill_prompt_len);
-    let prefill_timings = measure_timings(
+    info!("Running prefill-heavy cold ({prefill_prompt_len},{SNAPSHOT_PREFILL_OUTPUT_LEN})");
+    let prefill_timings = measure_cold_prefill_timings(model, prefill_prompt_len, &args.run)?;
+    let prefill_metrics = snapshot_metrics(build_request_metrics(&prefill_timings));
+
+    info!(
+        "Running prefill-heavy cached ({prefill_prompt_len},{SNAPSHOT_PREFILL_OUTPUT_LEN}) — repeated prompt, prefix-cache warm"
+    );
+    let cached_tokens = synthetic_prompt_tokens(prefill_prompt_len);
+    let cached_timings = measure_timings(
         model,
-        std::slice::from_ref(&prefill_tokens),
+        std::slice::from_ref(&cached_tokens),
         SNAPSHOT_PREFILL_OUTPUT_LEN,
         &args.run,
         cli.cuda_profiler_capture,
     )?;
-    let prefill_metrics = build_request_metrics(&prefill_timings);
+    let cached_metrics = snapshot_metrics(build_request_metrics(&cached_timings));
 
     info!("Running decode-heavy ({SNAPSHOT_DECODE_PROMPT_LEN},{SNAPSHOT_DECODE_OUTPUT_LEN})");
     let decode_tokens = synthetic_prompt_tokens(SNAPSHOT_DECODE_PROMPT_LEN);
@@ -1879,7 +2697,7 @@ fn run_snapshot(
         &args.run,
         cli.cuda_profiler_capture,
     )?;
-    let decode_metrics = build_request_metrics(&decode_timings);
+    let decode_metrics = snapshot_metrics(build_request_metrics(&decode_timings));
 
     let model_name = model_display_name(&cli.model_path);
     let gpu = gpu_name();
@@ -1904,6 +2722,11 @@ fn run_snapshot(
             output_len: SNAPSHOT_PREFILL_OUTPUT_LEN,
             metrics: prefill_metrics,
         },
+        prefill_cached: Some(SnapshotProfile {
+            prompt_len: prefill_prompt_len,
+            output_len: SNAPSHOT_PREFILL_OUTPUT_LEN,
+            metrics: cached_metrics,
+        }),
         decode_heavy: SnapshotProfile {
             prompt_len: SNAPSHOT_DECODE_PROMPT_LEN,
             output_len: SNAPSHOT_DECODE_OUTPUT_LEN,
@@ -1933,7 +2756,7 @@ fn render_snapshot_text(report: &SnapshotReport, path: &Path) -> String {
     let _ = writeln!(out, "commit: {}\n", report.commit);
     let _ = writeln!(
         out,
-        "prefill_heavy ({},{}):",
+        "prefill_heavy ({},{}) [cold — distinct prompt/iter]:",
         report.prefill_heavy.prompt_len, report.prefill_heavy.output_len
     );
     let _ = writeln!(
@@ -1941,6 +2764,18 @@ fn render_snapshot_text(report: &SnapshotReport, path: &Path) -> String {
         "  TTFT  p50={:.2}ms  p99={:.2}ms",
         report.prefill_heavy.metrics.ttft_ms.p50_ms, report.prefill_heavy.metrics.ttft_ms.p99_ms
     );
+    if let Some(cached) = &report.prefill_cached {
+        let _ = writeln!(
+            out,
+            "\nprefill_cached ({},{}) [warm — repeated prompt, prefix-cache hit]:",
+            cached.prompt_len, cached.output_len
+        );
+        let _ = writeln!(
+            out,
+            "  TTFT  p50={:.2}ms  p99={:.2}ms",
+            cached.metrics.ttft_ms.p50_ms, cached.metrics.ttft_ms.p99_ms
+        );
+    }
     let _ = writeln!(
         out,
         "\ndecode_heavy ({},{}):",
@@ -2154,6 +2989,7 @@ fn main() -> Result<()> {
             Command::Curve(_) => "curve",
             Command::Snapshot(_) => "snapshot",
             Command::Compare(_) => "compare",
+            Command::Mixed(_) => "mixed",
         },
         cli.model_path,
         cli.cuda_graph,

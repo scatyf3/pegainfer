@@ -1,0 +1,121 @@
+{
+  "kind": "mixed",
+  "commit": "f5aa646",
+  "date": "2026-06-08",
+  "gpu": "NVIDIA GeForce RTX 5070 Ti",
+  "run": {
+    "command": "mixed",
+    "model_path": "models/Qwen3-4B",
+    "model_type": "Qwen3",
+    "cuda_graph": true,
+    "load_ms": 10836.181079,
+    "label": null
+  },
+  "config": {
+    "bg_prompt_len": 512,
+    "bg_concurrency": 6,
+    "bg_output_len": 1536,
+    "inj_prompt_len": 4096,
+    "inj_output_len": 1,
+    "qps": 0.5,
+    "num_injections": 8,
+    "inj_warm_frac": 0.0,
+    "warmup": 5,
+    "seed": 42
+  },
+  "baseline_itl": {
+    "avg_ms": 14.237408,
+    "p50_ms": 14.22547,
+    "p95_ms": 15.133918,
+    "p99_ms": 15.495474,
+    "max_ms": 16.075647,
+    "samples": 6786
+  },
+  "mixed_itl": {
+    "all": {
+      "avg_ms": 18.685008,
+      "p50_ms": 14.051386,
+      "p95_ms": 15.000191,
+      "p99_ms": 18.945757,
+      "max_ms": 595.543343,
+      "samples": 5173
+    },
+    "steady": {
+      "avg_ms": 14.093323,
+      "p50_ms": 14.050002000000001,
+      "p95_ms": 14.956973999999999,
+      "p99_ms": 15.336333,
+      "max_ms": 23.808905000000003,
+      "samples": 5038
+    },
+    "stall": {
+      "avg_ms": 190.039883,
+      "p50_ms": 14.467974,
+      "p95_ms": 523.861801,
+      "p99_ms": 595.542853,
+      "max_ms": 595.543343,
+      "samples": 135
+    },
+    "stall_gap_count": 135,
+    "total_gap_count": 5173
+  },
+  "injections": [
+    {
+      "index": 0,
+      "warm": false,
+      "prefill_ms": 534.941101,
+      "arrival_offset_ms": 0.00368
+    },
+    {
+      "index": 1,
+      "warm": false,
+      "prefill_ms": 497.230068,
+      "arrival_offset_ms": 2000.1858549999997
+    },
+    {
+      "index": 2,
+      "warm": false,
+      "prefill_ms": 599.318959,
+      "arrival_offset_ms": 4000.3226310000005
+    },
+    {
+      "index": 3,
+      "warm": false,
+      "prefill_ms": 494.567642,
+      "arrival_offset_ms": 6000.435614999999
+    },
+    {
+      "index": 4,
+      "warm": false,
+      "prefill_ms": 492.73095500000005,
+      "arrival_offset_ms": 8000.516074
+    },
+    {
+      "index": 5,
+      "warm": false,
+      "prefill_ms": 507.34275399999996,
+      "arrival_offset_ms": 10000.656231
+    },
+    {
+      "index": 6,
+      "warm": false,
+      "prefill_ms": 500.401416,
+      "arrival_offset_ms": 12000.753252999999
+    },
+    {
+      "index": 7,
+      "warm": false,
+      "prefill_ms": 496.755684,
+      "arrival_offset_ms": 14000.862321999999
+    }
+  ],
+  "decision_inputs": {
+    "baseline_p50_ms": 14.22547,
+    "baseline_p99_ms": 15.495474,
+    "mixed_p50_ms": 14.051386,
+    "mixed_p99_ms": 18.945757,
+    "p99_delta_ms": 3.4502830000000007,
+    "p99_delta_pct": 22.2663921090765
+  },
+  "warnings": []
+}

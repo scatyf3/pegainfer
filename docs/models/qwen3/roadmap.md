@@ -18,7 +18,7 @@ Tracking issue: see the `[Model] Qwen3-4B roadmap` GitHub issue. Cross-model ite
 | TP correctness | ✗ zero automated coverage — every test runs `device_ordinals: vec![0]` | grep `tests/` |
 | LoRA | ⚠ load/unload/TP/request-level all built; only test uses a **zero adapter** | `lora.rs`, `tests/lora_smoke.rs:91-130` |
 | Non-greedy sampling | ✗ zero correctness coverage (all tests greedy); penalties/min_p absent from `SamplingParams` | grep `tests/` |
-| Bench snapshots | ⚠ exist but ~187 commits stale; not refreshed by #216; no mixed-load ITL profile | `bench_snapshots/` |
+| Bench snapshots | ✓ refreshed (#244): prefill split cold (~1385ms)/cached (~26ms) to defeat the default-on prefix cache, decode TPOT 12.0ms; mixed-load ITL profile landed (`bench_serving mixed`). Cold prefill ~+15% vs the 190-commit-old baseline — real drift, unbisected | `bench_snapshots/rtx-5070-ti/qwen3-4b.json`, `docs/benchmarks/mixed-load-itl.md` |
 | PP | greenfield (aspiration only) | — |
 
 ## Roadmap
@@ -32,7 +32,7 @@ Tracking issue: see the `[Model] Qwen3-4B roadmap` GitHub issue. Cross-model ite
 
 ### Next
 
-5. **Mixed-load ITL profile, then the chunked-prefill decision.** A long prompt admitted mid-decode runs as one unbounded prefill in the unified step (no per-step token budget exists) — the documented +38% ITL p99 tail vs vLLM. Maintainer stance on chunked prefill is *conditional* (`scheduler.md`: varied-length workloads break waves naturally); so the gate is a tracked mixed-load benchmark profile first, implementation only if the tail matters for a real workload. Refresh the stale bench snapshots in the same pass.
+5. **Mixed-load ITL profile — landed (#244); chunked-prefill decision is a conditional no-go.** `bench_serving mixed` (open-loop: decode-heavy background + low-QPS long-prompt injector) measures the tail ([mixed-load-itl](../../benchmarks/mixed-load-itl.md)). A long prompt freezes every active decode for the whole prefill (4k → ~490ms, 10k → ~2730ms), but reaches headline p99 only when the stall-gap fraction exceeds ~1% (grows with qps *and* prompt length). At #244's low-QPS moderate-prompt profile **p99 stays baseline-order (~15–19ms, at the knee)**; at 1 req/s or 10k prompts it jumps to 487/2818ms. Decision: implement chunked prefill only behind a hard ITL-p99 SLA in a sustained/long-prompt regime — not for the low-QPS profile. Stale prefill/decode bench snapshots still want a refresh (separate pass).
 6. **TP correctness pass.** Run the golden gate over `device_ordinals [0,1]` (skip when <2 GPUs) so the tolerances also guard sharding + all-reduce; TP=8 systematic pass after. A reduction-order or shard-offset bug is currently invisible to every gate.
 7. **LoRA real-adapter accuracy gate.** The last open #173 acceptance criterion: teacher-force one real PEFT adapter against an HF reference with the golden-gate tolerances. Today base==(base+zero·LoRA) is all that's proven. The salt-isolation of the prefix cache also deserves a pinning test (adapter A's blocks must not hit for adapter B).
 8. **Eviction behavioral test.** Evict-then-remiss is never exercised: register a prefix, release it, pressure the pool until eviction, assert truncated/zero match + correct recompute. kvbm-logical layer needs no GPU.

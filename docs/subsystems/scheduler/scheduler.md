@@ -1,8 +1,8 @@
 # Scheduler
 
-> **TL;DR:** Single dedicated thread owns all GPU resources. Continuous batching with FCFS prefill-priority, paged KV cache, bucket CUDA Graphs for batch decode, and a unified forward pass when prefill and decode coexist. On Qwen3-4B (varied-length Poisson QPS=2, RTX 5070 Ti) within 2% of vLLM throughput while winning TTFT (−16%), TPOT (−3%), and latency stability across the board. Remaining gap is ITL p99 tail from prefill stalls.
+> **TL;DR:** Single dedicated thread owns all GPU resources. Continuous batching with FCFS prefill-priority, paged KV cache, bucket CUDA Graphs for batch decode, and a unified forward pass when prefill and decode coexist. On Qwen3-4B (varied-length Poisson QPS=2, RTX 5070 Ti) within 2% of vLLM throughput while winning TTFT (−16%), TPOT (−3%), and latency stability across the board. Remaining gap is an ITL p99 tail from prefill stalls — now measured ([mixed-load-itl](../../benchmarks/mixed-load-itl.md)): severe per-event but rare at low QPS, so chunked prefill stays conditional.
 >
-> **Last touched:** 2026-05.
+> **Last touched:** 2026-06.
 
 ## Why this shape
 
@@ -93,7 +93,7 @@ Related: FlashInfer's f32 fused RoPE rounds differently from a precomputed bf16 
 
 ## Known issues / open work
 
-- **ITL p99 tail (291 vs vLLM 211ms).** Large prefills block in-flight decode. Chunked prefill would fix it. Low priority — varied-length workloads break the waves naturally, and fixed-length ITL p99 already beats vLLM.
+- **ITL p99 tail — measured** ([mixed-load-itl](../../benchmarks/mixed-load-itl.md), RTX 5070 Ti). A long prompt admitted mid-decode freezes *every* active decode for the whole prefill (4k → ~490ms stall, 10k → ~2730ms; steady gaps and p50 stay at baseline ~14ms). Two knobs: severity = prefill wall-time; frequency = stall-gap fraction `≈ qps/(qps + (1−qps·prefill_s)/TPOT)`, which reaches headline p99 above ~1%. At #244's low-QPS moderate-prompt profile (0.5 req/s, 4k, 6 decodes) frac ~0.9% (≈ the 1% cutoff, so p99 wobbles at the knee) → **p99 stays baseline-order (~15–19ms)**, the 490ms cost only at max. At 1 req/s (frac 2.7%) p99 = 487ms; a 10k prompt even at 0.3 req/s (frac 2.3%) → p99 = 2818ms. So low-QPS varied-length workloads break the waves naturally at p99 — the tail bites only under sustained arrival or long prompts.
 - **9 failures at QPS=2.** Needs root-cause — likely KV pressure or empty-prompt rejection from the random dataset.
 - **Batch decode per-row sampling.** `(0..bs).map(gpu_sample_into)` regresses to O(bs) launches; scheduler still hot-pathes through this. See memory entry on FlashInfer sampling for the redesign target (batched per-request sampling metadata, mini-sglang/vLLM style).
 - **Qwen3.5 partial paged migration.** Decode is fully paged via the scheduler. Prefill still scatters from contiguous HND staging into paged KV before attention. Migration mirrors Qwen3's step 2 with HD256 + partial RoPE (rotary_dim=64 of head_dim=256) wrinkles.
@@ -102,5 +102,5 @@ Related: FlashInfer's f32 fused RoPE rounds differently from a precomputed bf16 
 
 - Qwen3.5 prefill fully paged (eliminate contiguous staging)
 - Batch sampling redesign with per-request metadata
-- Chunked prefill — only if ITL p99 becomes a hard requirement
+- Chunked prefill — **conditional no-go** per [mixed-load-itl](../../benchmarks/mixed-load-itl.md): implement only behind a hard ITL p99 SLA *and* a sustained long-prompt regime (long prompts overlapping ≳1% of decode steps). Not justified for the low-QPS varied-length profile.
 - Preemption / priority queuing — deferred, no current pain
