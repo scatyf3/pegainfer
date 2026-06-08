@@ -1730,8 +1730,7 @@ fn wait_for_head_start(counters: &Arc<[AtomicUsize]>, target: usize, timeout: Du
     }
 }
 
-/// Decide whether injection `index` is warm, spreading `warm_frac` of injections
-/// evenly across the run (Bresenham-style, so e.g. 0.5 → every other injection).
+/// Decide whether injection `index` is warm, spreading `warm_frac` of injections evenly across the run
 fn injection_is_warm(index: usize, warm_frac: f64) -> bool {
     let count = |k: usize| (k as f64 * warm_frac).floor() as usize;
     count(index + 1) > count(index)
@@ -1751,9 +1750,6 @@ fn run_injector(
     let mut windows = Vec::with_capacity(num_injections);
     let mut records = Vec::with_capacity(num_injections);
     let mut overruns = 0usize;
-    // Reserved salt for warm injections: shared (so they hit each other) and
-    // distinct from every cold salt (1..=num_injections) and from salt 0 (the
-    // background prompt) so no accidental cross-prefix hit.
     let warm_salt = num_injections + 100;
     let t0 = Instant::now();
     for index in 0..num_injections {
