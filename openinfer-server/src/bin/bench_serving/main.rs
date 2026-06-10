@@ -35,12 +35,13 @@ use openinfer_vllm_support::load_tokenizer as load_vllm_tokenizer;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod cli;
+mod report;
 use cli::*;
+use report::*;
 
 const SNAPSHOT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bench_snapshots");
 const SNAPSHOT_PREFILL_OUTPUT_LEN: usize = 1;
@@ -63,174 +64,6 @@ const REGRESSION_TTFT_PCT: f64 = 3.0;
 const DEFAULT_REQUEST_PROMPT: &str = "Tell me a story";
 const DEFAULT_CURVE_PROMPT_LEN: usize = 512;
 const SYNTHETIC_PATTERN: &str = "token_id = 100 + (idx % 1000)";
-
-#[derive(Debug, Clone, Serialize)]
-struct RunInfo {
-    command: &'static str,
-    model_path: String,
-    model_type: String,
-    cuda_graph: bool,
-    load_ms: f64,
-    label: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct PromptDescriptor {
-    source: String,
-    prompt_tokens: usize,
-    prompt_preview: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DurationStats {
-    avg_ms: f64,
-    p50_ms: f64,
-    p95_ms: f64,
-    p99_ms: f64,
-    max_ms: f64,
-    samples: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CountStats {
-    min: usize,
-    max: usize,
-    avg: f64,
-    samples: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GeneratedTokenTrace {
-    hash: String,
-    prefix: Vec<u32>,
-    len: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct RequestWorkload {
-    prompt: PromptDescriptor,
-    output_len: usize,
-    concurrency: usize,
-    warmup: usize,
-    iters: usize,
-    seed: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RequestMetrics {
-    ttft_ms: DurationStats,
-    first_decode_step_ms: Option<DurationStats>,
-    steady_tpot_ms: Option<DurationStats>,
-    e2e_ms: DurationStats,
-    generated_tokens: CountStats,
-    #[serde(default)]
-    generated_token_traces: Vec<GeneratedTokenTrace>,
-    request_tok_s: Option<f64>,
-    decode_tok_s: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct RequestIterationTiming {
-    index: usize,
-    ttft_ms: f64,
-    first_decode_step_ms: Option<f64>,
-    steady_tpot_ms: Option<DurationStats>,
-    e2e_ms: f64,
-    generated_tokens: usize,
-    generated_token_trace: GeneratedTokenTrace,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotProfile {
-    prompt_len: usize,
-    output_len: usize,
-    metrics: RequestMetrics,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SnapshotReport {
-    commit: String,
-    date: String,
-    model: String,
-    gpu: String,
-    /// Parallel layout the snapshot was measured under (e.g. "tp1-dp8-deepep").
-    /// Absent in snapshots that predate multi-GPU model lines.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    parallel: Option<String>,
-    prefill_heavy: SnapshotProfile,
-    decode_heavy: SnapshotProfile,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct RequestReport {
-    run: RunInfo,
-    workload: RequestWorkload,
-    metrics: RequestMetrics,
-    iterations: Vec<RequestIterationTiming>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct MatrixWorkload {
-    prompt_lens: Vec<usize>,
-    output_lens: Vec<usize>,
-    warmup: usize,
-    iters: usize,
-    seed: u64,
-    synthetic_pattern: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct MatrixCell {
-    prompt_len: usize,
-    output_len: usize,
-    ttft_ms: DurationStats,
-    e2e_ms: DurationStats,
-    first_decode_step_ms: Option<DurationStats>,
-    steady_tpot_ms: Option<DurationStats>,
-    generated_tokens: CountStats,
-    request_tok_s: Option<f64>,
-    decode_tok_s: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct MatrixReport {
-    run: RunInfo,
-    workload: MatrixWorkload,
-    cells: Vec<MatrixCell>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct CurveWorkload {
-    prompt: PromptDescriptor,
-    output_len: usize,
-    window: usize,
-    warmup: usize,
-    iters: usize,
-    seed: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct CurveWindow {
-    ctx_start: usize,
-    ctx_end: usize,
-    tpot_ms: DurationStats,
-    decode_tok_s: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct CurveReport {
-    run: RunInfo,
-    workload: CurveWorkload,
-    windows: Vec<CurveWindow>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum BenchReport {
-    Request(Box<RequestReport>),
-    Matrix(MatrixReport),
-    Curve(CurveReport),
-}
 
 fn dur_ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
