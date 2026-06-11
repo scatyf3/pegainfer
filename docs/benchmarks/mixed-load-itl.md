@@ -12,11 +12,11 @@ moderate prompt keeps p99 at baseline (~15ms); ≥8k prompts or ≥1 req/s blow 
 **Decision: chunked prefill is a conditional no-go** — justify only behind a hard
 ITL-p99 SLA in a sustained-arrival or long-prompt, cold-prefix regime.
 
-Reproduce the full cube with [`scripts/sweep_mixed_itl.sh`](../../scripts/sweep_mixed_itl.sh).
 The canonical (0.5 req/s, 4k, cold) point is a tracked profile in the Qwen3-4B
 snapshot — `bench_snapshots/{gpu}/qwen3-4b.json` under `mixed_itl`, refreshed by
 `bench_serving snapshot` alongside the prefill/decode profiles (reported by
-`compare`, but not regression-gated — see below).
+`compare`, but not regression-gated — see below). The minimal sweep that maps the
+rest of the cube is inlined under [Reproduce](#reproduce).
 
 ## Why this measurement exists
 
@@ -153,22 +153,23 @@ CUDA_HOME=/opt/cuda NVCC_PREPEND_FLAGS="-ccbin g++-13" \
   OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=/abs/.venv/bin/python \
   cargo build -r -p openinfer-server --bin bench_serving
 
-# Quick sweep — the severity axis in two cells (~1 min, no thermal control).
-# 4k stays at baseline order, 8k blows the p99 to ~1s: the whole finding in two runs.
-# (Cold, qps=0.5. Omits 12k — it sits at the 16 GB activation ceiling and OOMs run-to-run;
-#  the full cube below adds the qps × warm axes, cooldowns, and the throttle-check.)
-for p in 4096 8192; do
-  ./target/release/bench_serving --model-path models/Qwen3-4B \
-    --format json --out /tmp/itl_$p.json \
-    mixed --bg-prompt-len 512 --bg-concurrency 4 --bg-output-len 1024 \
-          --inj-prompt-len $p --inj-output-len 1 --qps 0.5 \
-          --num-injections 3 --warmup 3 --inj-warm-frac 0.0 --skip-baseline >/dev/null 2>&1
-  echo "${p}: p99=$(python3 -c "import json;print(f\"{json.load(open('/tmp/itl_$p.json'))['mixed_itl']['all']['p99_ms']:.1f}\")")ms"
-done
-# → 4096: p99≈20ms   8192: p99≈1290ms
-
-# Full qps × warm × prompt cube (with cooldowns + throttle-check):
-bash scripts/sweep_mixed_itl.sh
+# Minimal severity × frequency sweep (cold prompts into 4-way decode), prints
+# background-decode ITL p99 per cell. The `sleep 25` is load-bearing: a tight
+# back-to-back loop throttles the GPU and fabricates saturation (see Thermal) —
+# without it 4k@0.5 reads ~570ms instead of ~15ms.
+# Extend to the full cube by widening the loops (add 12288 — OOMs run-to-run on
+# 16 GB — and an --inj-warm-frac axis) and aggregating the JSON yourself.
+BIN=./target/release/bench_serving; M=models/Qwen3-4B
+BG="--bg-prompt-len 512 --bg-concurrency 4 --bg-output-len 1024"
+for p in 4096 8192; do for q in 0.5 1.0; do
+  sleep 25
+  $BIN --model-path $M --format json --out /tmp/itl.json \
+    mixed $BG --inj-prompt-len $p --inj-output-len 1 --qps $q \
+    --num-injections 5 --warmup 5 --inj-warm-frac 0.0 --skip-baseline >/dev/null 2>&1
+  echo "p=$p q=$q  p99=$(python3 -c "import json;print(f\"{json.load(open('/tmp/itl.json'))['mixed_itl']['all']['p99_ms']:.0f}\")")ms"
+done; done
+# → p=4096 q=0.5 p99≈15ms   q=1.0 p99≈500ms
+#   p=8192 q=0.5 p99≈1600ms q=1.0 p99 saturated (multi-second)
 
 # Canonical cell — refreshed into the tracked snapshot alongside prefill/decode:
 CUDA_HOME=/opt/cuda LIBRARY_PATH=/usr/lib/wsl/lib:/opt/cuda/lib64 \
@@ -178,10 +179,12 @@ CUDA_HOME=/opt/cuda LIBRARY_PATH=/usr/lib/wsl/lib:/opt/cuda/lib64 \
 
 The canonical cell is folded into the `snapshot` subcommand as the `mixed_itl`
 profile, so it refreshes with the prefill/decode profiles and its history lives in
-git ([bench-regression.md](../conventions/bench-regression.md)). The full
-qps×warm×prompt sweep above stays a **standalone diagnostic** — too noisy/expensive
-for the tracked set. `compare` prints the ITL delta for context but does **not**
-gate on it: the stall tail is thermally and run-to-run noisy (see Caveats).
+git ([bench-regression.md](../conventions/bench-regression.md)). The wider
+qps×warm×prompt sweep stays an **ad-hoc diagnostic** — the minimal loop above is
+the whole of it; widen the loops for more cells. It's deliberately not a tracked
+script: too noisy/expensive for the regression set. `compare` prints the ITL delta
+for context but does **not** gate on it: the stall tail is thermally and
+run-to-run noisy (see Caveats).
 
 ### Caveats
 - **16k+ prompts OOM** on 16 GB (prefill activation scratch); 12k is the ceiling.
