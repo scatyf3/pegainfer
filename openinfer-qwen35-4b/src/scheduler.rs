@@ -3,16 +3,6 @@
 //! Mirrors the Qwen3 scheduler but manages:
 //! - `RecurrentState` alongside `KvState` (linear attention layers)
 //! - `BatchDecodeGraphState` for CUDA Graph batch decode (stable-address slots)
-//!
-//! Prefill is **chunked at the scheduler level** (issue #375): a long prompt is
-//! sliced across steps under a per-step token budget so the decode batch is
-//! serviced between chunks. New prompts enter the `prefilling` FIFO, which owns
-//! their growing `KvState` + `RecurrentState` + a `cursor` until the prompt is
-//! exhausted; each step feeds the next budgeted chunk into `batch_prefill_logits`
-//! / `unified_step` exactly as a whole-prompt prefill would (the executor reads
-//! its base position from `kv.seq_len()`, so successive chunks continue in place).
-//! When a prompt finishes, its recurrent state is D2D-copied into a graph slot.
-//! On request retirement, swap-remove compaction keeps slots dense.
 
 mod plan;
 
@@ -62,9 +52,9 @@ struct ActiveRequest35 {
     logprobs: usize,
 }
 
-/// A request whose prompt is being prefilled across multiple scheduler steps
-/// (chunked prefill). It owns its growing KV and recurrent state until the
-/// prompt is exhausted, at which point it is promoted into the decode batch.
+/// A request whose prompt is being prefilled across multiple scheduler steps.
+/// It owns its growing KV and recurrent state until the prompt is exhausted,
+/// at which point it is promoted into the decode batch.
 struct PrefillingRequest35 {
     req: SchedulerRequest,
     kv: KvState,
@@ -75,12 +65,10 @@ struct PrefillingRequest35 {
     step_chunk: usize,
 }
 
-/// Default per-step chunked-prefill token budget (mirrors Qwen3's `max_prefill_tokens`).
+/// Default per-step chunked-prefill token budget
 const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
 
 /// Per-step prefill token budget, overridable via `OPENINFER_QWEN35_PREFILL_BUDGET`.
-/// Smaller → lower decode ITL tail, higher prompt TTFT; absurdly large → standard
-/// one-pass prefill.
 fn prefill_tokens_per_step() -> usize {
     std::env::var("OPENINFER_QWEN35_PREFILL_BUDGET")
         .ok()
