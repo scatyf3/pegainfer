@@ -4,8 +4,15 @@
 //! - `RecurrentState` alongside `KvState` (linear attention layers)
 //! - `BatchDecodeGraphState` for CUDA Graph batch decode (stable-address slots)
 //!
-//! Prefill allocates temporary `RecurrentState`s, then D2D-copies them into
-//! graph slots. On request retirement, swap-remove compaction keeps slots dense.
+//! Prefill is **chunked at the scheduler level** (issue #375): a long prompt is
+//! sliced across steps under a per-step token budget so the decode batch is
+//! serviced between chunks. New prompts enter the `prefilling` FIFO, which owns
+//! their growing `KvState` + `RecurrentState` + a `cursor` until the prompt is
+//! exhausted; each step feeds the next budgeted chunk into `batch_prefill_logits`
+//! / `unified_step` exactly as a whole-prompt prefill would (the executor reads
+//! its base position from `kv.seq_len()`, so successive chunks continue in place).
+//! When a prompt finishes, its recurrent state is D2D-copied into a graph slot.
+//! On request retirement, swap-remove compaction keeps slots dense.
 
 mod plan;
 
@@ -31,8 +38,9 @@ use openinfer_core::sampler::SamplingParams;
 use openinfer_core::tensor::HiddenStates;
 
 use self::plan::{
-    ActiveKvBudget, ExecutionPlan, RejectReason, admit_pending_requests, compaction_after_retire,
-    max_kv_tokens, slot_for_new_request,
+    ActiveKvBudget, ExecutionPlan, PrefillKvBudget, RejectReason, admit_pending_requests,
+    compaction_after_retire, max_kv_tokens, plan_prefill_chunks, prefilling_future_pages,
+    slot_for_new_request,
 };
 
 // ── Internal types ──────────────────────────────────────────────────────
@@ -52,6 +60,33 @@ struct ActiveRequest35 {
     params: SamplingParams,
     /// Number of top logprobs to return (0 = disabled).
     logprobs: usize,
+}
+
+/// A request whose prompt is being prefilled across multiple scheduler steps
+/// (chunked prefill). It owns its growing KV and recurrent state until the
+/// prompt is exhausted, at which point it is promoted into the decode batch.
+struct PrefillingRequest35 {
+    req: SchedulerRequest,
+    kv: KvState,
+    rec: RecurrentState,
+    /// Prompt tokens prefilled so far.
+    cursor: usize,
+    /// Tokens to prefill in the step currently scheduled (set by `take_prefill_chunks`).
+    step_chunk: usize,
+}
+
+/// Default per-step chunked-prefill token budget (mirrors Qwen3's `max_prefill_tokens`).
+const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
+
+/// Per-step prefill token budget, overridable via `OPENINFER_QWEN35_PREFILL_BUDGET`.
+/// Smaller → lower decode ITL tail, higher prompt TTFT; absurdly large → standard
+/// one-pass prefill.
+fn prefill_tokens_per_step() -> usize {
+    std::env::var("OPENINFER_QWEN35_PREFILL_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_PREFILL_TOKENS)
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────
@@ -151,7 +186,9 @@ fn scheduler_loop(
     let mut rng = StdRng::seed_from_u64(seed);
     let mut active: Vec<ActiveRequest35> = Vec::new();
     let mut deferred: Vec<SchedulerRequest> = Vec::new();
+    let mut prefilling: Vec<PrefillingRequest35> = Vec::new();
     let max_batch = graph_state.slot_states.len();
+    let prefill_budget = prefill_tokens_per_step();
 
     info!("scheduler ready (max_batch={})", max_batch);
 
@@ -162,8 +199,9 @@ fn scheduler_loop(
             pending.push(req);
         }
 
-        // 2. Nothing active and nothing pending → block until a request arrives
-        if active.is_empty() && pending.is_empty() {
+        // 2. Nothing in flight (no decode, no in-progress prefill) and nothing
+        //    pending → block until a request arrives.
+        if active.is_empty() && prefilling.is_empty() && pending.is_empty() {
             if let Some(req) = submit_rx.blocking_recv() {
                 pending.push(req);
             } else {
@@ -175,6 +213,11 @@ fn scheduler_loop(
             }
         }
 
+        // 3. Compute the available budget and admit new prompts. Each in-flight
+        //    prefill reserves the graph slot it will promote into and the future
+        //    KV growth it will still claim, so shrink the slot/page budgets handed
+        //    to admission accordingly. This guarantees `active + prefilling ≤
+        //    max_batch`, so a promotion's `slot_for_new_request` never fails.
         let active_budget: Vec<ActiveKvBudget> = active
             .iter()
             .map(|req| ActiveKvBudget {
@@ -183,12 +226,29 @@ fn scheduler_loop(
                 max_tokens: req.max_tokens,
             })
             .collect();
+        let page_size = model.kv_pool().layout().page_size;
+        let prefilling_budget: Vec<PrefillKvBudget> = prefilling
+            .iter()
+            .map(|p| PrefillKvBudget {
+                current_tokens: p.cursor,
+                prompt_len: p.req.prompt_tokens.len(),
+                max_tokens: p.req.max_tokens,
+            })
+            .collect();
+        // `available_pages` already excludes pages held by in-flight prefill KV
+        // (the `cursor` tokens); subtract the future growth those prefills will
+        // still claim, the same reservation `active_future_pages` makes for decode.
+        let page_budget = model
+            .kv_pool()
+            .available_pages()
+            .saturating_sub(prefilling_future_pages(&prefilling_budget, page_size));
+        let decode_batching_slot = max_batch.saturating_sub(prefilling.len());
         let admission = admit_pending_requests(
             pending,
             &active_budget,
-            max_batch,
-            model.kv_pool().layout().page_size,
-            model.kv_pool().available_pages(),
+            decode_batching_slot,
+            page_size,
+            page_budget,
             // KvPool capacity includes the CUDA Graph padding page reserved at
             // construction, so a real request can use at most the remaining pages.
             model.kv_pool().capacity_pages().saturating_sub(1),
@@ -199,25 +259,58 @@ fn scheduler_loop(
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
         }
-        let pending = admission.pending;
-        for req in &pending {
+        deferred = admission.deferred;
+
+        // 4. Move freshly admitted prompts into the chunked-prefill queue. Their
+        //    KV and recurrent state persist here across steps as chunks advance.
+        for req in admission.pending {
             debug!(
                 "request admitted: request_id={:?} prompt_len={} max_tokens={}",
                 req.request_id,
                 req.prompt_tokens.len(),
                 req.max_tokens
             );
+            match RecurrentState::new(model.device_ctx(), model.config()) {
+                Ok(rec) => prefilling.push(PrefillingRequest35 {
+                    kv: model.alloc_kv(),
+                    rec,
+                    cursor: 0,
+                    step_chunk: 0,
+                    req,
+                }),
+                Err(e) => {
+                    warn!("failed to allocate recurrent state for new request: {e}");
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: e.to_string(),
+                        prompt_tokens: req.prompt_tokens.len(),
+                        completion_tokens: 0,
+                    });
+                }
+            }
         }
-        deferred = admission.deferred;
 
-        if let Some(plan) = plan::build_next_plan(!active.is_empty(), pending) {
+        // 5. Take this step's budgeted prefill chunk off the front of the queue,
+        //    then dispatch by plan. Unfinished chunks are re-queued at the FRONT
+        //    of `prefilling` inside `prefill_batch` / `unified_step_sched`.
+        let scheduled = take_prefill_chunks(&mut prefilling, prefill_budget);
+        if let Some(plan) = plan::build_next_plan(!active.is_empty(), scheduled) {
             match plan {
-                ExecutionPlan::Unified { pending } => {
-                    unified_step_sched(&model, &mut active, pending, &mut graph_state, &mut rng)
-                }
-                ExecutionPlan::Prefill { pending } => {
-                    prefill_batch(&model, &mut active, pending, &mut graph_state, &mut rng)
-                }
+                ExecutionPlan::Unified { pending } => unified_step_sched(
+                    &model,
+                    &mut active,
+                    pending,
+                    &mut prefilling,
+                    &mut graph_state,
+                    &mut rng,
+                ),
+                ExecutionPlan::Prefill { pending } => prefill_batch(
+                    &model,
+                    &mut active,
+                    pending,
+                    &mut prefilling,
+                    &mut graph_state,
+                    &mut rng,
+                ),
                 ExecutionPlan::Decode => {
                     decode_step(&model, &mut active, &mut graph_state, &mut rng);
                 }
@@ -251,136 +344,54 @@ fn send_rejection(req: &SchedulerRequest, reason: RejectReason) {
 
 // ── Batch prefill ───────────────────────────────────────────────────────
 
+/// Prefill this step's scheduled chunk for each queued prompt, then promote the
+/// prompts that finished and re-queue the rest. Mirrors the whole-prompt path,
+/// but the prompts are the per-step chunk windows and the KV/recurrent state
+/// comes from (and returns to) the `prefilling` queue.
 fn prefill_batch(
     model: &Qwen35Model,
     active: &mut Vec<ActiveRequest35>,
-    pending: Vec<SchedulerRequest>,
+    scheduled: Vec<PrefillingRequest35>,
+    prefilling: &mut Vec<PrefillingRequest35>,
     graph_state: &mut BatchDecodeGraphState,
     rng: &mut StdRng,
 ) {
-    let prompts: Vec<&[u32]> = pending.iter().map(|r| r.prompt_tokens.as_slice()).collect();
-    let mut kv_states: Vec<KvState> = (0..pending.len()).map(|_| model.alloc_kv()).collect();
-
-    // Allocate temporary recurrent states for prefill
-    let mut rec_states: Vec<RecurrentState> = (0..pending.len())
-        .map(|_| RecurrentState::new(model.device_ctx(), model.config()).unwrap())
-        .collect();
-    let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
-
-    let logits_vec = match model.batch_prefill_logits(&prompts, &mut kv_states, &mut rec_refs) {
+    let mut chunk = ScheduledChunk::from(scheduled);
+    // Scope the borrows of `chunk` to the executor call so the error path can
+    // move `chunk` into `fail_chunk`.
+    let result = {
+        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(|w| w.as_slice()).collect();
+        let mut rec_refs: Vec<&mut RecurrentState> = chunk.recs.iter_mut().collect();
+        model.batch_prefill_logits(&window_refs, &mut chunk.kvs, &mut rec_refs)
+    };
+    let logits = match result {
         Ok(v) => v,
         Err(e) => {
             warn!("batch prefill failed: {e}");
-            let message = e.to_string();
-            for req in pending {
-                let _ = req.token_tx.send(TokenEvent::Error {
-                    message: message.clone(),
-                    prompt_tokens: req.prompt_tokens.len(),
-                    completion_tokens: 0,
-                });
-            }
+            fail_chunk(chunk, &e.to_string());
             return;
         }
     };
 
     let (tokens, logprobs_vec) =
-        match sample_prefill_logits(model, &pending, &logits_vec, graph_state, rng) {
+        match sample_prefill_logits(model, &chunk.reqs, &logits, graph_state, rng) {
             Ok(v) => v,
             Err(e) => {
                 warn!("prefill sampling failed: {e}");
-                let message = e.to_string();
-                for req in pending {
-                    let _ = req.token_tx.send(TokenEvent::Error {
-                        message: message.clone(),
-                        prompt_tokens: req.prompt_tokens.len(),
-                        completion_tokens: 0,
-                    });
-                }
+                fail_chunk(chunk, &e.to_string());
                 return;
             }
         };
 
-    for (i, req) in pending.into_iter().enumerate() {
-        let prompt_len = req.prompt_tokens.len();
-        let first_token = tokens[i];
-        let logprob = logprobs_vec[i].clone();
-
-        if req.echo {
-            let echo_logprobs = vec![None; req.prompt_tokens.len()];
-            let _ = req.token_tx.send(TokenEvent::PromptTokens {
-                ids: req.prompt_tokens.clone(),
-                logprobs: echo_logprobs,
-            });
-        }
-
-        if !req.params.ignore_eos && model.is_stop_token(first_token) {
-            debug!(
-                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                req.request_id,
-                prompt_len,
-                0,
-                FinishReason::Stop
-            );
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens: prompt_len,
-                completion_tokens: 0,
-            });
-            continue;
-        }
-
-        if req
-            .token_tx
-            .send(TokenEvent::Token {
-                id: first_token,
-                logprob,
-            })
-            .is_err()
-        {
-            debug!(
-                "request dropped: client disconnected: request_id={:?} tokens_generated={}",
-                req.request_id, 0
-            );
-            continue;
-        }
-
-        if req.max_tokens <= 1 {
-            debug!(
-                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                req.request_id,
-                prompt_len,
-                1,
-                FinishReason::Length
-            );
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens: prompt_len,
-                completion_tokens: 1,
-            });
-            continue;
-        }
-
-        // Assign a graph slot and copy recurrent state into it
-        let slot_idx = slot_for_new_request(active.len(), graph_state.slot_states.len())
-            .expect("admission must reserve a graph slot");
-        graph_state
-            .copy_state_to_slot(model.device_ctx(), &rec_states[i], slot_idx)
-            .expect("copy recurrent state to slot failed");
-
-        let kv = std::mem::replace(&mut kv_states[i], model.alloc_kv());
-        active.push(ActiveRequest35 {
-            request_id: req.request_id,
-            token_tx: req.token_tx,
-            kv,
-            graph_slot_idx: slot_idx,
-            last_token: first_token,
-            generated_count: 1,
-            max_tokens: req.max_tokens,
-            prompt_len,
-            params: req.params,
-            logprobs: req.logprobs,
-        });
-    }
+    promote_or_requeue(
+        model,
+        active,
+        prefilling,
+        graph_state,
+        chunk,
+        &tokens,
+        &logprobs_vec,
+    );
 }
 
 fn sample_prefill_logits(
@@ -422,52 +433,42 @@ fn sample_prefill_logits(
     Ok((tokens, logprobs))
 }
 
-// ── Unified step (prefill + decode in one forward pass) ────────────────
+// ── Unified step (prefill chunk + decode in one forward pass) ──────────────
 
+/// Prefill this step's scheduled chunk AND decode the active batch in one
+/// `unified_step` call. Decode results are processed first (it may retire
+/// requests and free graph slots), then finished prompts are promoted into the
+/// freed slots and unfinished chunks re-queued.
 fn unified_step_sched(
     model: &Qwen35Model,
     active: &mut Vec<ActiveRequest35>,
-    pending: Vec<SchedulerRequest>,
+    scheduled: Vec<PrefillingRequest35>,
+    prefilling: &mut Vec<PrefillingRequest35>,
     graph_state: &mut BatchDecodeGraphState,
     rng: &mut StdRng,
 ) {
-    // Build prefill inputs
-    let prompts: Vec<&[u32]> = pending.iter().map(|r| r.prompt_tokens.as_slice()).collect();
-    let mut prefill_kv_states: Vec<KvState> =
-        (0..pending.len()).map(|_| model.alloc_kv()).collect();
-
-    // Allocate temporary recurrent states for prefill
-    let mut rec_states: Vec<RecurrentState> = (0..pending.len())
-        .map(|_| RecurrentState::new(model.device_ctx(), model.config()).unwrap())
-        .collect();
-    let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
-
-    // Build decode inputs
-    let decode_tokens: Vec<u32> = active.iter().map(|r| r.last_token).collect();
-    let mut decode_kv_refs: Vec<&mut KvState> = active.iter_mut().map(|r| &mut r.kv).collect();
-
-    // Run unified forward pass
-    let output = match model.unified_step(
-        &prompts,
-        &mut prefill_kv_states,
-        &mut rec_refs,
-        &decode_tokens,
-        &mut decode_kv_refs,
-        graph_state,
-    ) {
+    let mut chunk = ScheduledChunk::from(scheduled);
+    // Scope the borrows of `chunk` / `active` to the executor call so the error
+    // and decode-processing paths can use them afterwards.
+    let result = {
+        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(|w| w.as_slice()).collect();
+        let mut rec_refs: Vec<&mut RecurrentState> = chunk.recs.iter_mut().collect();
+        let decode_tokens: Vec<u32> = active.iter().map(|r| r.last_token).collect();
+        let mut decode_kv_refs: Vec<&mut KvState> = active.iter_mut().map(|r| &mut r.kv).collect();
+        model.unified_step(
+            &window_refs,
+            &mut chunk.kvs,
+            &mut rec_refs,
+            &decode_tokens,
+            &mut decode_kv_refs,
+            graph_state,
+        )
+    };
+    let output = match result {
         Ok(v) => v,
         Err(e) => {
             warn!("unified step failed: {e}");
             let message = e.to_string();
-            // Notify all pending requests
-            for req in pending {
-                let _ = req.token_tx.send(TokenEvent::Error {
-                    message: message.clone(),
-                    prompt_tokens: req.prompt_tokens.len(),
-                    completion_tokens: 0,
-                });
-            }
-            // Notify all active decode requests
             for req in active.drain(..) {
                 let _ = req.token_tx.send(TokenEvent::Error {
                     message: message.clone(),
@@ -475,11 +476,13 @@ fn unified_step_sched(
                     completion_tokens: req.generated_count,
                 });
             }
+            fail_chunk(chunk, &message);
             return;
         }
     };
 
-    // Process decode results FIRST (before adding prefill results to active)
+    // Process decode results FIRST (it may retire requests and free graph slots
+    // that promotion then fills densely).
     if output.decoded {
         process_decode_logits(model, active, graph_state, rng);
     }
@@ -487,106 +490,26 @@ fn unified_step_sched(
     let prefill_logits = output
         .prefill_logits
         .as_ref()
-        .expect("pending unified step must return prefill logits");
+        .expect("scheduled prefill chunk must return prefill logits");
     let (tokens, logprobs_vec) =
-        match sample_prefill_logits(model, &pending, prefill_logits, graph_state, rng) {
+        match sample_prefill_logits(model, &chunk.reqs, prefill_logits, graph_state, rng) {
             Ok(v) => v,
             Err(e) => {
                 warn!("unified prefill sampling failed: {e}");
-                let message = e.to_string();
-                for req in pending {
-                    let _ = req.token_tx.send(TokenEvent::Error {
-                        message: message.clone(),
-                        prompt_tokens: req.prompt_tokens.len(),
-                        completion_tokens: 0,
-                    });
-                }
+                fail_chunk(chunk, &e.to_string());
                 return;
             }
         };
 
-    // Process prefill results: sample first token, add to active
-    for (i, req) in pending.into_iter().enumerate() {
-        let prompt_len = req.prompt_tokens.len();
-        let first_token = tokens[i];
-        let logprob = logprobs_vec[i].clone();
-
-        if req.echo {
-            let echo_logprobs = vec![None; req.prompt_tokens.len()];
-            let _ = req.token_tx.send(TokenEvent::PromptTokens {
-                ids: req.prompt_tokens.clone(),
-                logprobs: echo_logprobs,
-            });
-        }
-
-        if !req.params.ignore_eos && model.is_stop_token(first_token) {
-            debug!(
-                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                req.request_id,
-                prompt_len,
-                0,
-                FinishReason::Stop
-            );
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens: prompt_len,
-                completion_tokens: 0,
-            });
-            continue;
-        }
-
-        if req
-            .token_tx
-            .send(TokenEvent::Token {
-                id: first_token,
-                logprob,
-            })
-            .is_err()
-        {
-            debug!(
-                "request dropped: client disconnected: request_id={:?} tokens_generated={}",
-                req.request_id, 0
-            );
-            continue;
-        }
-
-        if req.max_tokens <= 1 {
-            debug!(
-                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                req.request_id,
-                prompt_len,
-                1,
-                FinishReason::Length
-            );
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens: prompt_len,
-                completion_tokens: 1,
-            });
-            continue;
-        }
-
-        // Assign graph slot and copy recurrent state
-        let slot_idx = slot_for_new_request(active.len(), graph_state.slot_states.len())
-            .expect("admission must reserve a graph slot");
-        graph_state
-            .copy_state_to_slot(model.device_ctx(), &rec_states[i], slot_idx)
-            .expect("copy recurrent state to slot failed");
-
-        let kv = std::mem::replace(&mut prefill_kv_states[i], model.alloc_kv());
-        active.push(ActiveRequest35 {
-            request_id: req.request_id,
-            token_tx: req.token_tx,
-            kv,
-            graph_slot_idx: slot_idx,
-            last_token: first_token,
-            generated_count: 1,
-            max_tokens: req.max_tokens,
-            prompt_len,
-            params: req.params,
-            logprobs: req.logprobs,
-        });
-    }
+    promote_or_requeue(
+        model,
+        active,
+        prefilling,
+        graph_state,
+        chunk,
+        &tokens,
+        &logprobs_vec,
+    );
 }
 
 // ── Decode step (pure decode, CUDA Graph enabled) ──────────────────────
@@ -850,6 +773,192 @@ fn compact_slot(
 
         active[compaction.moved_to].graph_slot_idx = compaction.moved_to;
     }
+}
+
+// ── Chunked-prefill helpers ────────────────────────────────────────────────
+
+/// This step's scheduled prefill set, decomposed into parallel arrays so the
+/// owned KV / recurrent state can be passed to the executor (`&mut [KvState]`)
+/// and then moved into the decode batch (finished) or back into the queue.
+struct ScheduledChunk {
+    reqs: Vec<SchedulerRequest>,
+    kvs: Vec<KvState>,
+    recs: Vec<RecurrentState>,
+    /// Prompt cursor after this step's chunk (== prompt len ⇒ finished).
+    ends: Vec<usize>,
+    /// This step's chunk slice per request (`prompt_tokens[cursor..end]`).
+    windows: Vec<Vec<u32>>,
+}
+
+impl From<Vec<PrefillingRequest35>> for ScheduledChunk {
+    fn from(scheduled: Vec<PrefillingRequest35>) -> Self {
+        let n = scheduled.len();
+        let mut chunk = ScheduledChunk {
+            reqs: Vec::with_capacity(n),
+            kvs: Vec::with_capacity(n),
+            recs: Vec::with_capacity(n),
+            ends: Vec::with_capacity(n),
+            windows: Vec::with_capacity(n),
+        };
+        for p in scheduled {
+            let end = p.cursor + p.step_chunk;
+            chunk
+                .windows
+                .push(p.req.prompt_tokens[p.cursor..end].to_vec());
+            chunk.ends.push(end);
+            chunk.reqs.push(p.req);
+            chunk.kvs.push(p.kv);
+            chunk.recs.push(p.rec);
+        }
+        chunk
+    }
+}
+
+/// Pull this step's prefill set off the FRONT of `prefilling`, capping the
+/// step's total forwarded prompt tokens at `prefill_budget`.
+fn take_prefill_chunks(
+    prefilling: &mut Vec<PrefillingRequest35>,
+    prefill_budget: usize,
+) -> Vec<PrefillingRequest35> {
+    let remaining: Vec<usize> = prefilling
+        .iter()
+        .map(|p| p.req.prompt_tokens.len() - p.cursor)
+        .collect();
+    let chunks = plan_prefill_chunks(&remaining, prefill_budget);
+    let mut scheduled: Vec<PrefillingRequest35> = prefilling.drain(0..chunks.len()).collect();
+    for (p, chunk) in scheduled.iter_mut().zip(&chunks) {
+        p.step_chunk = *chunk;
+    }
+    scheduled
+}
+
+/// Report a forward/sampling failure to every request in the failed chunk.
+fn fail_chunk(chunk: ScheduledChunk, message: &str) {
+    for req in chunk.reqs {
+        let _ = req.token_tx.send(TokenEvent::Error {
+            message: message.to_string(),
+            prompt_tokens: req.prompt_tokens.len(),
+            completion_tokens: 0,
+        });
+    }
+}
+
+/// For each request in the just-prefilled chunk: if its prompt is now exhausted,
+/// sample its first token, emit events, and move it into the decode batch;
+/// otherwise re-queue it (with an advanced cursor) at the FRONT of `prefilling`.
+/// `tokens` / `logprobs` are indexed by request order in `chunk`.
+fn promote_or_requeue(
+    model: &Qwen35Model,
+    active: &mut Vec<ActiveRequest35>,
+    prefilling: &mut Vec<PrefillingRequest35>,
+    graph_state: &mut BatchDecodeGraphState,
+    chunk: ScheduledChunk,
+    tokens: &[u32],
+    logprobs: &[Option<TokenLogprob>],
+) {
+    let ScheduledChunk {
+        reqs,
+        kvs,
+        recs,
+        ends,
+        ..
+    } = chunk;
+    let mut still_prefilling: Vec<PrefillingRequest35> = Vec::new();
+
+    for (i, (((req, kv), rec), end)) in reqs.into_iter().zip(kvs).zip(recs).zip(ends).enumerate() {
+        // Not finished: re-queue with the advanced cursor; its sampled token
+        // (a mid-prompt position) is discarded.
+        if end < req.prompt_tokens.len() {
+            still_prefilling.push(PrefillingRequest35 {
+                req,
+                kv,
+                rec,
+                cursor: end,
+                step_chunk: 0,
+            });
+            continue;
+        }
+
+        let prompt_len = req.prompt_tokens.len();
+        let first_token = tokens[i];
+        let logprob = logprobs[i].clone();
+
+        if req.echo {
+            let echo_logprobs = vec![None; req.prompt_tokens.len()];
+            let _ = req.token_tx.send(TokenEvent::PromptTokens {
+                ids: req.prompt_tokens.clone(),
+                logprobs: echo_logprobs,
+            });
+        }
+
+        if !req.params.ignore_eos && model.is_stop_token(first_token) {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id,
+                prompt_len,
+                0,
+                FinishReason::Stop
+            );
+            let _ = req.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                prompt_tokens: prompt_len,
+                completion_tokens: 0,
+            });
+            continue;
+        }
+
+        if req
+            .token_tx
+            .send(TokenEvent::Token {
+                id: first_token,
+                logprob,
+            })
+            .is_err()
+        {
+            debug!(
+                "request dropped: client disconnected: request_id={:?} tokens_generated={}",
+                req.request_id, 0
+            );
+            continue;
+        }
+
+        if req.max_tokens <= 1 {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id,
+                prompt_len,
+                1,
+                FinishReason::Length
+            );
+            let _ = req.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: prompt_len,
+                completion_tokens: 1,
+            });
+            continue;
+        }
+
+        // Assign a graph slot and copy recurrent state into it.
+        let slot_idx = slot_for_new_request(active.len(), graph_state.slot_states.len())
+            .expect("admission must reserve a graph slot");
+        graph_state
+            .copy_state_to_slot(model.device_ctx(), &rec, slot_idx)
+            .expect("copy recurrent state to slot failed");
+        active.push(ActiveRequest35 {
+            request_id: req.request_id,
+            token_tx: req.token_tx,
+            kv,
+            graph_slot_idx: slot_idx,
+            last_token: first_token,
+            generated_count: 1,
+            max_tokens: req.max_tokens,
+            prompt_len,
+            params: req.params,
+            logprobs: req.logprobs,
+        });
+    }
+
+    prefilling.splice(0..0, still_prefilling);
 }
 
 #[cfg(test)]
