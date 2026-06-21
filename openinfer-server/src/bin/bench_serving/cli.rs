@@ -160,7 +160,7 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct PromptInputArgs {
-   max_prefill_tokens /// Inline prompt text
+    /// Inline prompt text
     #[arg(long, conflicts_with_all = ["prompt_file", "prompt_len"])]
     pub(crate) prompt: Option<String>,
 
