@@ -58,21 +58,39 @@ impl LocalEngineBridge {
             )
         })?;
 
+        let kv_capacity = self.handle.kv_capacity();
+        let (num_gpu_blocks, block_size, kv_cache_size_tokens, kv_cache_max_concurrency) =
+            match kv_capacity {
+                Some(c) => {
+                    // vLLM single-group concurrency: blocks / ceil(max_len / block_size).
+                    let blocks_per_req =
+                        u64::from(self.max_model_len).div_ceil(c.block_size as u64);
+                    (
+                        c.total_blocks as u64,
+                        c.block_size as u64,
+                        Some(c.total_tokens() as u64),
+                        Some(c.total_blocks as f64 / blocks_per_req as f64),
+                    )
+                }
+                None => (0, 16, None, None),
+            };
         let ready = EngineCoreReadyResponse {
-            max_model_len: self.max_model_len as u64,
-            num_gpu_blocks: 0,
-            // TODO(#401): report the real paged-KV block size and capacity from the
-            // openinfer scheduler once the vLLM frontend consumes ready_response KV fields.
-            block_size: 16,
+            max_model_len: u64::from(self.max_model_len),
+            num_gpu_blocks,
+            block_size,
             dp_stats_address: None,
             dtype: ModelDtype::BFloat16,
             vllm_version: "openinfer-local-bridge".to_string(),
-            // The in-process bridge fronts a single engine instance.
             world_size: 1,
             data_parallel_size: 1,
-            kv_cache_size_tokens: None,
-            kv_cache_max_concurrency: None,
+            kv_cache_size_tokens,
+            kv_cache_max_concurrency,
         };
+        info!(
+            "local engine KV capacity: {kv_capacity:?} -> \
+             kv_cache_size_tokens={kv_cache_size_tokens:?} \
+             kv_cache_max_concurrency={kv_cache_max_concurrency:?}"
+        );
         input
             .send(ZmqMessage::from(encode_msgpack(&ready)?))
             .await
