@@ -47,6 +47,7 @@ kernel-report = [
 [dev-dependencies]
 openinfer-vllm-support = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+tracing-subscriber = { workspace = true }
 vllm-text = { workspace = true }
 
 [[bin]]
