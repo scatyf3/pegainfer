@@ -512,6 +512,26 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    // Custom-mask NHD single-sequence prefill (same layout). `custom_mask` is a
+    // bit-packed [seq_len, kv_len] boolean: query i attends key j iff bit
+    // (i*kv_len + j) is set. Needs >= ceil(seq_len*kv_len / 8) bytes. EAGLE-3 tree
+    // draft primitive (each node attends only its ancestors).
+    pub fn single_prefill_nhd_custom_mask_cuda(
+        q: *const Half,
+        output: *mut Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        custom_mask: *const u8,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        kv_len: i32,
+        max_seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
     // Single-query NHD decode over a contiguous KV cache (FlashInfer SingleDecode,
     // no partition-KV). Structurally one query, so there is no `seq_len` parameter.
     pub fn single_decode_nhd_cuda(

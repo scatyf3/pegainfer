@@ -28,6 +28,15 @@ using Variant = DefaultAttention</*custom_mask=*/false,
                                  /*sliding_window=*/false,
                                  /*logits_soft_cap=*/false,
                                  /*alibi=*/false>;
+// Tree/speculative variant: an arbitrary per-(query,key) attention mask replaces
+// the causal rule. Used by EAGLE-3 tree drafting/verify, where each tree node must
+// attend only to its ancestors. `maybe_custom_mask` is a bit-packed [qo_len, kv_len]
+// boolean (row-major, offset = qo_idx*kv_len + kv_idx, bit set = attend); under
+// MaskMode::kCustom the mask fully defines visibility (no causal is layered on top).
+using CustomMaskVariant = DefaultAttention</*custom_mask=*/true,
+                                           /*sliding_window=*/false,
+                                           /*logits_soft_cap=*/false,
+                                           /*alibi=*/false>;
 
 // Helper: build paged_kv_t from our page-first layout.
 //
@@ -819,6 +828,75 @@ int single_prefill_nhd_causal_cuda(
             /*USE_FP16_QK_REDUCTION=*/false,
             MaskMode::kCausal,
             Variant,
+            PrefillParamsT>(
+            params,
+            /*tmp=*/nullptr,
+            reinterpret_cast<cudaStream_t>(stream)));
+}
+
+// Custom-mask variant of the NHD single-sequence prefill: same token-major layout
+// (q/output [seq_len, q_dim], k/v [max_seq_len, kv_dim]) but visibility is defined
+// entirely by `custom_mask` — a bit-packed [seq_len, kv_len] boolean. Query row i
+// (qo_idx=i) attends key column j (kv_idx=j) iff bit (i*kv_len + j) is set. The
+// caller must provide at least ceil(seq_len*kv_len / 8) bytes. This is EAGLE-3's
+// tree-draft primitive: each frontier node attends only its ancestors' KV.
+int single_prefill_nhd_custom_mask_cuda(
+    void*          q,
+    void*          output,
+    void*          k_cache,
+    void*          v_cache,
+    const uint8_t* custom_mask,
+    int32_t        num_qo_heads,
+    int32_t        num_kv_heads,
+    int32_t        head_dim,
+    int32_t        seq_len,
+    int32_t        kv_len,
+    int32_t        max_seq_len,
+    float          sm_scale,
+    void*          stream)
+{
+    if (q == nullptr || output == nullptr || k_cache == nullptr || v_cache == nullptr ||
+        custom_mask == nullptr || num_qo_heads <= 0 || num_kv_heads <= 0 || head_dim != 128 ||
+        seq_len <= 0 || kv_len <= 0 || max_seq_len < kv_len) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+
+    uint32_t q_stride_n  = num_qo_heads * head_dim;
+    uint32_t q_stride_h  = head_dim;
+    uint32_t kv_stride_n = num_kv_heads * head_dim;
+    uint32_t kv_stride_h = head_dim;
+
+    PrefillParamsT params(
+        reinterpret_cast<DType*>(q),
+        reinterpret_cast<DType*>(k_cache),
+        reinterpret_cast<DType*>(v_cache),
+        const_cast<uint8_t*>(custom_mask),
+        reinterpret_cast<DType*>(output),
+        /*lse=*/nullptr,
+        /*maybe_alibi_slopes=*/nullptr,
+        num_qo_heads,
+        num_kv_heads,
+        static_cast<uint32_t>(seq_len),
+        static_cast<uint32_t>(kv_len),
+        q_stride_n,
+        q_stride_h,
+        kv_stride_n,
+        kv_stride_h,
+        static_cast<uint32_t>(head_dim),
+        /*window_left=*/-1,
+        /*logits_soft_cap=*/0.0f,
+        sm_scale,
+        /*rope_scale=*/1.0f,
+        /*rope_theta=*/1e6f);
+
+    return static_cast<int>(
+        SinglePrefillWithKVCacheDispatched<
+            /*HEAD_DIM_QK=*/128,
+            /*HEAD_DIM_VO=*/128,
+            PosEncodingMode::kNone,
+            /*USE_FP16_QK_REDUCTION=*/false,
+            MaskMode::kCustom,
+            CustomMaskVariant,
             PrefillParamsT>(
             params,
             /*tmp=*/nullptr,

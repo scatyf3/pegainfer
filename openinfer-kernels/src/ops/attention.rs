@@ -1035,6 +1035,84 @@ pub fn single_prefill_nhd_causal_into(
     Ok(())
 }
 
+/// Custom-mask NHD single-sequence prefill — EAGLE-3's tree-draft attention.
+///
+/// Same NHD token-major layout as [`single_prefill_nhd_causal_into`], but instead of
+/// a causal rule, visibility is an explicit **bit-packed** `[q_seq_len, kv_len]` mask:
+/// query row `i` attends key column `j` iff bit `i * kv_len + j` is set (LSB-first
+/// within each byte, `1` = attend). Under FlashInfer's `MaskMode::kCustom` the mask
+/// fully defines visibility — no causal is layered on top — so feeding a causal mask
+/// reproduces [`single_prefill_nhd_causal_into`] bit-for-bit (see tests). A draft
+/// tree encodes each node's ancestor set as its mask row.
+///
+/// `custom_mask` must hold at least `ceil(q_seq_len * kv_len / 8)` bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn single_prefill_nhd_custom_mask_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    row_offset: usize,
+    q_seq_len: usize,
+    k_cache: &HiddenStates,
+    v_cache: &HiddenStates,
+    output: &mut HiddenStates,
+    custom_mask: &CudaSlice<u8>,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+) -> Result<()> {
+    assert_eq!(q.hidden_dim, num_q_heads * head_dim);
+    assert_eq!(output.hidden_dim, q.hidden_dim);
+    assert_eq!(output.seq_len, q.seq_len);
+    assert_eq!(k_cache.hidden_dim, num_kv_heads * head_dim);
+    assert_eq!(v_cache.hidden_dim, k_cache.hidden_dim);
+    assert_eq!(v_cache.seq_len, k_cache.seq_len);
+    assert!(kv_len <= k_cache.seq_len);
+    assert!(
+        row_offset + q_seq_len <= q.seq_len,
+        "custom-mask prefill row range [{}..{}) exceeds seq_len {}",
+        row_offset,
+        row_offset + q_seq_len,
+        q.seq_len
+    );
+    let need_bytes = (q_seq_len * kv_len).div_ceil(8);
+    assert!(
+        custom_mask.len() >= need_bytes,
+        "custom mask has {} bytes, need >= ceil({q_seq_len}*{kv_len}/8) = {need_bytes}",
+        custom_mask.len()
+    );
+
+    let byte_offset = (row_offset * q.hidden_dim * std::mem::size_of::<bf16>()) as u64;
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let q_ptr = q_ptr + byte_offset;
+    let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v_cache.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let out_ptr = out_ptr + byte_offset;
+    let (mask_ptr, _gm) = custom_mask.device_ptr(&ctx.stream);
+    let result = unsafe {
+        ffi::single_prefill_nhd_custom_mask_cuda(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            mask_ptr as *const u8,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            q_seq_len as i32,
+            kv_len as i32,
+            k_cache.seq_len as i32,
+            1.0f32 / (head_dim as f32).sqrt(),
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("single_prefill_nhd_custom_mask_cuda failed with error {result}");
+    }
+    Ok(())
+}
+
 /// Batched QK RMSNorm + partial RoPE for Qwen3.5 HD256 decode.
 ///
 /// Reads Q from interleaved `q_full` ([q, gate] per head), writes prepared Q into `q`,
@@ -1586,4 +1664,104 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod custom_mask_tests {
+    use super::*;
+
+    /// Deterministic bf16 fill, varied per index/seed, roughly in [-1, 1).
+    fn fill(n: usize, seed: usize) -> Vec<bf16> {
+        (0..n)
+            .map(|i| {
+                let h = i
+                    .wrapping_mul(2_654_435_761)
+                    .wrapping_add(seed.wrapping_mul(40_503));
+                bf16::from_f32((h % 1000) as f32 / 500.0 - 1.0)
+            })
+            .collect()
+    }
+
+    /// Feeding a *causal* bit-mask through the custom-mask prefill must reproduce
+    /// the dedicated causal kernel: same q/k/v, same visible set → same output.
+    /// This pins down the mask layout (bit `i*kv_len + j`, LSB-first, 1 = attend)
+    /// and FlashInfer's `MaskMode::kCustom` semantics (mask alone defines
+    /// visibility) before tree drafting relies on them.
+    #[test]
+    fn custom_causal_mask_matches_causal_kernel() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let head_dim = 128usize;
+        let num_q_heads = 2usize;
+        let num_kv_heads = 1usize; // GQA group size 2
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let q_seq_len = 4usize;
+        let kv_len = 6usize;
+        let max_seq_len = kv_len;
+
+        let q = HiddenStates::from_host(&ctx, &fill(q_dim * q_seq_len, 1), q_dim, q_seq_len)?;
+        let k = HiddenStates::from_host(&ctx, &fill(kv_dim * max_seq_len, 2), kv_dim, max_seq_len)?;
+        let v = HiddenStates::from_host(&ctx, &fill(kv_dim * max_seq_len, 3), kv_dim, max_seq_len)?;
+
+        // Reference: the dedicated causal kernel.
+        let mut out_causal = HiddenStates::zeros(&ctx, q_dim, q_seq_len)?;
+        single_prefill_nhd_causal_into(
+            &ctx,
+            &q,
+            0,
+            q_seq_len,
+            &k,
+            &v,
+            &mut out_causal,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            kv_len,
+        )?;
+
+        // Equivalent bit-packed causal mask: query row i is at absolute position
+        // `kv_len - q_seq_len + i` (FlashInfer bottom-right alignment), so it attends
+        // key col j iff j <= that position.
+        let mut mask = vec![0u8; (q_seq_len * kv_len).div_ceil(8)];
+        for i in 0..q_seq_len {
+            let last = kv_len - q_seq_len + i;
+            for j in 0..=last {
+                let bit = i * kv_len + j;
+                mask[bit / 8] |= 1u8 << (bit % 8);
+            }
+        }
+        let mask_d = ctx.stream.clone_htod(&mask)?;
+
+        let mut out_custom = HiddenStates::zeros(&ctx, q_dim, q_seq_len)?;
+        single_prefill_nhd_custom_mask_into(
+            &ctx,
+            &q,
+            0,
+            q_seq_len,
+            &k,
+            &v,
+            &mut out_custom,
+            &mask_d,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            kv_len,
+        )?;
+
+        let a = out_causal.to_host(&ctx)?;
+        let b = out_custom.to_host(&ctx)?;
+        assert_eq!(a.len(), b.len());
+        let max_abs = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        // Single KV tile here, so both paths mask the same entries in the same
+        // reduction order → bit-exact, not merely within tolerance.
+        assert!(
+            max_abs == 0.0,
+            "custom causal-mask output must match the causal kernel bit-for-bit; max|Δ|={max_abs}"
+        );
+        Ok(())
+    }
 }
