@@ -9,9 +9,11 @@ use openinfer_core::tensor::{DeviceMatrix, DeviceVec};
 mod forward;
 mod loading;
 mod reservation;
+mod tree;
 
 pub(crate) use forward::{Eagle3RequestState, Eagle3Scratch};
 pub(crate) use reservation::Eagle3MemoryReservation;
+pub(crate) use tree::{EAGLE3_DEFAULT_TREE_BRANCHING, Eagle3Tree};
 
 /// Number of tokens the EAGLE-3 chain drafts per speculative round (γ; the verify
 /// span is `EAGLE3_CHAIN_LENGTH + 1`: the current token plus γ drafts). v1 is a
