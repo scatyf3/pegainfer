@@ -340,6 +340,24 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    // EAGLE-3 RoPE with per-token positions from a GPU array (`positions[token]`,
+    // length max(q_len,k_len)); q and k at a token share its position. For a
+    // same-depth tree/beam frontier that rotates at one position.
+    pub fn eagle3_rope_positions_cuda(
+        q: *mut Half,
+        k: *mut Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        positions: *const i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        q_len: i32,
+        k_len: i32,
+        cos_max_pos: i32,
+        stream: CUstream,
+    ) -> i32;
+
     // Scatter contiguous KV → paged layout (one layer, FlashInfer prefill append).
     pub fn paged_kv_scatter_cuda(
         kv_data: *const Half,

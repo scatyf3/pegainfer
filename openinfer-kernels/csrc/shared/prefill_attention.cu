@@ -270,6 +270,71 @@ __global__ void eagle3_rope_kernel(
     data[offset] = result;
 }
 
+// Same as eagle3_rope_kernel, but each token's absolute RoPE position is read from
+// a per-token GPU array `positions[token]` (q and k at a given token share it)
+// instead of `start + token`. Lets a same-tree-depth frontier — where all N nodes
+// sit at ONE position — be rotated in a single launch. Bit-identical to
+// eagle3_rope_kernel whenever `positions[token] == start_pos + token`.
+__global__ void eagle3_rope_positions_kernel(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ cos_cache,
+    const __nv_bfloat16* __restrict__ sin_cache,
+    const int* __restrict__ positions,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int q_len,
+    int k_len,
+    int cos_max_pos
+) {
+    int head_global = blockIdx.x;
+    int token = blockIdx.y;
+    int d = threadIdx.x;
+
+    bool is_q = (head_global < num_q_heads);
+    int local_heads = is_q ? num_q_heads : num_kv_heads;
+    int seq_len = is_q ? q_len : k_len;
+    if (token >= seq_len) return;
+
+    int head_local = is_q ? head_global : (head_global - num_q_heads);
+    if (head_local >= local_heads) return;
+
+    __nv_bfloat16* data = is_q ? q : k;
+    int dim_stride = local_heads * head_dim;
+    int pos = __ldg(positions + token);
+    if (pos < 0 || pos >= cos_max_pos) __trap();
+
+    int offset = token * dim_stride + head_local * head_dim + d;
+
+    __shared__ __nv_bfloat16 smem[HEAD_DIM];
+    smem[d] = data[offset];
+    __syncthreads();
+
+    int half = head_dim / 2;
+    __nv_bfloat16 result;
+    if (d < half) {
+        float lo = __bfloat162float(smem[d]);
+        float hi = __bfloat162float(smem[d + half]);
+        float c = __bfloat162float(cos_cache[pos * head_dim + d]);
+        float s = __bfloat162float(sin_cache[pos * head_dim + d]);
+        float lo_cos = __bfloat162float(__float2bfloat16(lo * c));
+        float hi_sin = __bfloat162float(__float2bfloat16(hi * s));
+        result = __float2bfloat16(lo_cos - hi_sin);
+    } else {
+        int pair_d = d - half;
+        float lo = __bfloat162float(smem[pair_d]);
+        float hi = __bfloat162float(smem[d]);
+        float c = __bfloat162float(cos_cache[pos * head_dim + pair_d]);
+        float s = __bfloat162float(sin_cache[pos * head_dim + pair_d]);
+        float lo_sin = __bfloat162float(__float2bfloat16(lo * s));
+        float hi_cos = __bfloat162float(__float2bfloat16(hi * c));
+        result = __float2bfloat16(lo_sin + hi_cos);
+    }
+
+    data[offset] = result;
+}
+
 extern "C" {
 
 // ============================================================================
@@ -387,6 +452,38 @@ int eagle3_rope_cuda(
         q, k, cos_cache, sin_cache,
         num_q_heads, num_kv_heads, head_dim, q_len, k_len,
         q_start_pos, k_start_pos, cos_max_pos);
+    return static_cast<int>(cudaGetLastError());
+}
+
+// Per-token-positions RoPE for EAGLE-3. Like eagle3_rope_cuda but positions come
+// from a GPU array `positions[token]` (length max(q_len, k_len)); q and k share the
+// per-token position. Used by the tree/beam draft where a whole same-depth frontier
+// rotates at one position. Bounds are enforced per-token in the kernel (__trap on
+// pos out of [0, cos_max_pos)).
+int eagle3_rope_positions_cuda(
+    __nv_bfloat16* q,
+    __nv_bfloat16* k,
+    const __nv_bfloat16* cos_cache,
+    const __nv_bfloat16* sin_cache,
+    const int* positions,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int q_len,
+    int k_len,
+    int cos_max_pos,
+    cudaStream_t stream
+) {
+    if (q == nullptr || k == nullptr || cos_cache == nullptr || sin_cache == nullptr ||
+        positions == nullptr || num_q_heads <= 0 || num_kv_heads <= 0 || head_dim != HEAD_DIM ||
+        q_len <= 0 || k_len <= 0) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+
+    dim3 grid(num_q_heads + num_kv_heads, q_len > k_len ? q_len : k_len);
+    eagle3_rope_positions_kernel<<<grid, head_dim, 0, stream>>>(
+        q, k, cos_cache, sin_cache, positions,
+        num_q_heads, num_kv_heads, head_dim, q_len, k_len, cos_max_pos);
     return static_cast<int>(cudaGetLastError());
 }
 

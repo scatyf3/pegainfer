@@ -13,6 +13,9 @@ mod tree;
 
 pub(crate) use forward::{Eagle3RequestState, Eagle3Scratch};
 pub(crate) use reservation::Eagle3MemoryReservation;
+// Consumed by the tree/beam rollout (next stage); the single-step draft generator
+// lands first, so the topology helpers are re-exported but not referenced yet.
+#[allow(unused_imports)]
 pub(crate) use tree::{EAGLE3_DEFAULT_TREE_BRANCHING, Eagle3Tree};
 
 /// Number of tokens the EAGLE-3 chain drafts per speculative round (γ; the verify

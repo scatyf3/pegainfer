@@ -53,6 +53,19 @@ pub(crate) struct Eagle3Scratch {
     logits: HiddenStates,        // [draft_vocab, 1]
 }
 
+/// Result of one tree/beam draft step over an N-node frontier
+/// ([`Eagle3DraftModel::draft_frontier_topk`]).
+pub(crate) struct FrontierTopK {
+    /// Per frontier node (in the order of `tokens`): up to `top_k` next-token
+    /// candidates as `(target_vocab_id, logprob)`, descending by logprob. May be
+    /// shorter than `top_k` if some draft-vocab candidates map outside the target
+    /// vocab (rare).
+    pub(crate) per_node: Vec<Vec<(u32, f32)>>,
+    /// `[hidden, N]` per-node output residual stream (post-MLP), i.e. each node's
+    /// decoder output — the seed the beam gathers (by parent) for the next depth.
+    pub(crate) out_hidden: HiddenStates,
+}
+
 impl Eagle3DraftModel {
     fn q_dim(&self) -> usize {
         self.midlayer.q_dim
@@ -520,6 +533,233 @@ impl Eagle3DraftModel {
 
         state.cached_len = kv_len;
         Ok((logits, last_hidden))
+    }
+
+    /// One tree/beam draft step over a frontier of N nodes that all sit at the same
+    /// tree depth (hence one shared RoPE `position`). Runs a single batched draft
+    /// forward — the [`Self::prefill_batched`] op chain, but seeded with the
+    /// frontier's parent-gathered residual (not `fc(features)`), using the
+    /// per-token-positions RoPE, and a caller-supplied ancestor `packed_mask`
+    /// instead of a causal mask — then takes the per-node top-k over the draft
+    /// logits and maps them into the target vocab.
+    ///
+    /// The caller (the beam) owns the tree: it supplies `tokens`, `input_hidden`,
+    /// the KV slot layout (`kv_write_offset`, `kv_len`), and the `[N, kv_len]`
+    /// bit-packed mask whose prefix columns `[0, committed)` are all ones (every
+    /// node attends the committed context) and whose tree columns encode each
+    /// node's ancestor set (see [`crate::eagle3::Eagle3Tree::packed_ancestor_mask`]).
+    ///
+    /// Unlike [`Self::draft_step`] / [`Self::prefill_batched`], this does NOT advance
+    /// `state.cached_len`: the frontier's K/V land in scratch slots
+    /// `[kv_write_offset, kv_write_offset + N)` that the beam commits (or discards)
+    /// after verify. v1 selects top-k on the host (one full-logits D2H per step).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draft_frontier_topk(
+        &self,
+        target: &Qwen3Model,
+        state: &mut Eagle3RequestState,
+        tokens: &[u32],
+        input_hidden: &HiddenStates,
+        position: usize,
+        kv_write_offset: usize,
+        kv_len: usize,
+        packed_mask: &CudaSlice<u8>,
+        top_k: usize,
+    ) -> Result<FrontierTopK> {
+        let n = tokens.len();
+        anyhow::ensure!(n > 0, "EAGLE-3 frontier needs tokens");
+        anyhow::ensure!(top_k > 0, "EAGLE-3 frontier top_k must be > 0");
+        let hidden = self.config.hidden_size;
+        anyhow::ensure!(
+            input_hidden.hidden_dim == hidden && input_hidden.seq_len == n,
+            "EAGLE-3 frontier input_hidden must be [{hidden}, {n}], got [{}, {}]",
+            input_hidden.hidden_dim,
+            input_hidden.seq_len
+        );
+        anyhow::ensure!(
+            kv_write_offset + n <= state.max_cache_len && kv_len <= state.max_cache_len,
+            "EAGLE-3 frontier KV slots [{}, {}) / kv_len {} exceed cache {}",
+            kv_write_offset,
+            kv_write_offset + n,
+            kv_len,
+            state.max_cache_len
+        );
+
+        let ctx = target.device_ctx();
+        let q_dim = self.q_dim();
+        let kv_dim = self.kv_dim();
+        let inter = self.config.intermediate_size;
+        let eps = self.config.rms_norm_eps;
+        let num_q = self.config.num_attention_heads;
+        let num_kv = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim;
+
+        // Embed all N frontier tokens.
+        let mut token_ids_d = ctx.stream.alloc_zeros::<u32>(n)?;
+        ctx.stream.memcpy_htod(tokens, &mut token_ids_d)?;
+        let mut embed = HiddenStates::zeros(ctx, hidden, n)?;
+        target.get_embeddings_batch_into(&token_ids_d, &mut embed)?;
+
+        // Residual stream = a COPY of the parent-gathered hidden. The fused-add-norms
+        // below mutate the residual in place, so the caller's buffer must stay intact.
+        let mut residual = HiddenStates::zeros(ctx, hidden, n)?;
+        ops::copy_hidden_token_range_into(ctx, input_hidden, 0, &mut residual, 0, n)?;
+
+        let mut normed_embed = HiddenStates::zeros(ctx, hidden, n)?;
+        let mut normed_hidden = HiddenStates::zeros(ctx, hidden, n)?;
+        ops::rms_norm_batch_into(
+            ctx,
+            &embed,
+            &self.midlayer.input_layernorm,
+            eps,
+            &mut normed_embed,
+        );
+        ops::rms_norm_batch_into(
+            ctx,
+            &residual,
+            &self.midlayer.hidden_norm,
+            eps,
+            &mut normed_hidden,
+        );
+
+        let mut attn_input = HiddenStates::zeros(ctx, 2 * hidden, n)?;
+        ops::copy_hidden_rows_into(ctx, &normed_embed, &mut attn_input, 0)?;
+        ops::copy_hidden_rows_into(ctx, &normed_hidden, &mut attn_input, hidden)?;
+
+        let mut q = HiddenStates::zeros(ctx, q_dim, n)?;
+        let mut k = HiddenStates::zeros(ctx, kv_dim, n)?;
+        let mut v = HiddenStates::zeros(ctx, kv_dim, n)?;
+        ops::gemm_rows_into(ctx, &self.midlayer.qkv_proj, 0, q_dim, &attn_input, &mut q);
+        ops::gemm_rows_into(
+            ctx,
+            &self.midlayer.qkv_proj,
+            q_dim,
+            kv_dim,
+            &attn_input,
+            &mut k,
+        );
+        ops::gemm_rows_into(
+            ctx,
+            &self.midlayer.qkv_proj,
+            q_dim + kv_dim,
+            kv_dim,
+            &attn_input,
+            &mut v,
+        );
+
+        // RoPE: every node in this frontier shares the one tree-depth position.
+        let mut positions_d = ctx.stream.alloc_zeros::<i32>(n)?;
+        ctx.stream
+            .memcpy_htod(&vec![position as i32; n], &mut positions_d)?;
+        ops::eagle3_rope_positions_into(
+            ctx,
+            &mut q,
+            0,
+            n,
+            &mut k,
+            &self.cos_cache,
+            &self.sin_cache,
+            num_q,
+            num_kv,
+            head_dim,
+            &positions_d,
+        )?;
+
+        // Write the frontier's N K/V into the scratch tree slots, then attend under
+        // the caller's ancestor mask over [0, kv_len).
+        ops::copy_hidden_token_range_into(ctx, &k, 0, &mut state.k, kv_write_offset, n)?;
+        ops::copy_hidden_token_range_into(ctx, &v, 0, &mut state.v, kv_write_offset, n)?;
+
+        let mut attn_out = HiddenStates::zeros(ctx, q_dim, n)?;
+        ops::single_prefill_nhd_custom_mask_into(
+            ctx,
+            &q,
+            0,
+            n,
+            &state.k,
+            &state.v,
+            &mut attn_out,
+            packed_mask,
+            num_q,
+            num_kv,
+            head_dim,
+            kv_len,
+        )?;
+
+        let mut o = HiddenStates::zeros(ctx, hidden, n)?;
+        ops::gemm_into(ctx, &self.midlayer.o_proj, &attn_out, &mut o);
+
+        let mut normed_post = HiddenStates::zeros(ctx, hidden, n)?;
+        openinfer_kernels::ops::fused_add_rms_norm_round_batch_into(
+            ctx,
+            &mut residual,
+            &o,
+            &self.midlayer.post_attention_layernorm,
+            eps,
+            &mut normed_post,
+        )?;
+
+        let mut gate = HiddenStates::zeros(ctx, inter, n)?;
+        let mut up = HiddenStates::zeros(ctx, inter, n)?;
+        let mut act = HiddenStates::zeros(ctx, inter, n)?;
+        ops::gemm_rows_into(
+            ctx,
+            &self.midlayer.gate_up_proj,
+            0,
+            inter,
+            &normed_post,
+            &mut gate,
+        );
+        ops::gemm_rows_into(
+            ctx,
+            &self.midlayer.gate_up_proj,
+            inter,
+            inter,
+            &normed_post,
+            &mut up,
+        );
+        ops::silu_mul_batch_into(ctx, &gate, &up, &mut act)?;
+        let mut mlp_out = HiddenStates::zeros(ctx, hidden, n)?;
+        ops::gemm_into(ctx, &self.midlayer.down_proj, &act, &mut mlp_out);
+
+        let mut normed_final = HiddenStates::zeros(ctx, hidden, n)?;
+        openinfer_kernels::ops::fused_add_rms_norm_round_batch_into(
+            ctx,
+            &mut residual,
+            &mlp_out,
+            &self.norm,
+            eps,
+            &mut normed_final,
+        )?;
+
+        let mut logits = HiddenStates::zeros(ctx, self.config.draft_vocab_size, n)?;
+        ops::gemm_into(ctx, &self.lm_head, &normed_final, &mut logits);
+
+        // Host top-k per node (v1): one D2H of the full [draft_vocab, N] logits, then
+        // full-vocab log-softmax + top-k per column, mapped draft-vocab -> target.
+        let dvoc = self.config.draft_vocab_size;
+        let host = logits.to_host(ctx)?; // token-major: node s occupies [s*dvoc..(s+1)*dvoc]
+        let mut per_node = Vec::with_capacity(n);
+        for s in 0..n {
+            let row = &host[s * dvoc..(s + 1) * dvoc];
+            // `picked` is unused here (we only consume the top-k set), pass 0.
+            let tl = openinfer_sample::token_logprob_from_row(row, 0, top_k)
+                .context("EAGLE-3 frontier top-k: empty draft logits row")?;
+            let mut cands = Vec::with_capacity(tl.top_logprobs.len());
+            for (draft_id, logprob) in tl.top_logprobs {
+                // Drop candidates that map outside the target vocab (rare); a node may
+                // then carry < top_k candidates in v1.
+                if let Some(target_id) = self.draft_to_target_id(draft_id as usize) {
+                    cands.push((target_id, logprob));
+                }
+            }
+            per_node.push(cands);
+        }
+
+        Ok(FrontierTopK {
+            per_node,
+            out_hidden: residual,
+        })
     }
 
     /// Capture hook: build the draft KV for a freshly-prefilled prompt and record
@@ -1085,6 +1325,243 @@ mod tests {
         assert!(
             max_rel < 0.15,
             "drafter logits diverge from the official EAGLE reference: max rel Δ={max_rel}"
+        );
+    }
+
+    /// Upload a bit-packed `[n, kv_len]` mask (bit `i*kv_len + j` LSB-first, set iff
+    /// `attends(i, j)`), the layout `single_prefill_nhd_custom_mask_into` reads.
+    fn packed_mask_d(
+        ctx: &DeviceContext,
+        n: usize,
+        kv_len: usize,
+        attends: impl Fn(usize, usize) -> bool,
+    ) -> CudaSlice<u8> {
+        let mut bytes = vec![0u8; (n * kv_len).div_ceil(8)];
+        for i in 0..n {
+            for j in 0..kv_len {
+                if attends(i, j) {
+                    let b = i * kv_len + j;
+                    bytes[b / 8] |= 1u8 << (b % 8);
+                }
+            }
+        }
+        ctx.stream.clone_htod(&bytes).expect("mask H2D")
+    }
+
+    /// (a) A width-1 frontier with an all-ones mask must predict the same top-1 token
+    /// as `draft_step` at the same position: the custom-mask + positions-RoPE path
+    /// reduces to the single-decode path when one node attends the whole prefix.
+    #[test]
+    #[ignore = "requires GPU + Qwen3-4B target and EAGLE-3 drafter weights"]
+    fn eagle3_frontier_n1_matches_draft_step() {
+        let Some((target, drafter)) = load_or_skip() else {
+            return;
+        };
+        let ctx = target.device_ctx();
+        let feat_dim = drafter.fc_input_dim();
+        let hidden = drafter.config.hidden_size;
+
+        // A committed prefix of length C in the draft KV.
+        let prefix: Vec<u32> = vec![7, 8, 9, 10];
+        let c = prefix.len();
+        let feat_host: Vec<half::bf16> = (0..feat_dim * c)
+            .map(|i| half::bf16::from_f32(((i % 13) as f32 - 6.0) * 0.02))
+            .collect();
+        let features = HiddenStates::from_host(ctx, &feat_host, feat_dim, c).expect("features");
+        let feat_col_host: Vec<half::bf16> = (0..feat_dim)
+            .map(|i| half::bf16::from_f32(((i % 7) as f32 - 3.0) * 0.03))
+            .collect();
+        let feat_col = HiddenStates::from_host(ctx, &feat_col_host, feat_dim, 1).expect("feat col");
+        let tok = 42u32;
+
+        // draft_step reference: seed hidden = fc(feat_col), step at position C.
+        let mut state_ref = drafter.new_request_state(ctx, 64).expect("state ref");
+        drafter
+            .prefill_batched(&target, &mut state_ref, &features, &prefix, 0)
+            .expect("prefill ref");
+        let mut scratch = drafter.new_scratch(ctx).expect("scratch");
+        drafter
+            .seed_hidden_from_context(ctx, &feat_col, &mut scratch)
+            .expect("seed");
+        let host_ds = drafter
+            .draft_step(&target, &mut state_ref, &mut scratch, tok, c)
+            .expect("draft_step")
+            .to_host(ctx)
+            .expect("ds host");
+        let expected = drafter.draft_to_target_id(argmax(&host_ds)).expect("d2t");
+
+        // Generator: input_hidden = fc(feat_col), N=1, all-ones [1, C+1] mask.
+        let mut state_gen = drafter.new_request_state(ctx, 64).expect("state gen");
+        drafter
+            .prefill_batched(&target, &mut state_gen, &features, &prefix, 0)
+            .expect("prefill gen");
+        let mut input_hidden = HiddenStates::zeros(ctx, hidden, 1).expect("input hidden");
+        ops::gemm_into(ctx, &drafter.fc, &feat_col, &mut input_hidden);
+        let kv_len = c + 1;
+        let mask = packed_mask_d(ctx, 1, kv_len, |_i, _j| true);
+        let out = drafter
+            .draft_frontier_topk(
+                &target,
+                &mut state_gen,
+                &[tok],
+                &input_hidden,
+                c,
+                c,
+                kv_len,
+                &mask,
+                1,
+            )
+            .expect("frontier");
+
+        assert_eq!(out.per_node.len(), 1);
+        assert_eq!(out.per_node[0].len(), 1);
+        assert_eq!(out.out_hidden.hidden_dim, hidden);
+        assert_eq!(out.out_hidden.seq_len, 1);
+        assert_eq!(
+            out.per_node[0][0].0, expected,
+            "N=1 frontier top-1 must equal draft_step's argmax token"
+        );
+    }
+
+    /// (b) The host top-k glue: `token_logprob_from_row` returns the k largest ids
+    /// descending, and `draft_to_target_id` applies `target = draft + d2t[draft]`.
+    #[test]
+    #[ignore = "requires GPU + EAGLE-3 drafter weights (for d2t)"]
+    fn eagle3_frontier_topk_ordering_and_d2t() {
+        let Some((_target, drafter)) = load_or_skip() else {
+            return;
+        };
+        let dvoc = drafter.config.draft_vocab_size;
+        let mut row = vec![0f32; dvoc];
+        row[5] = 10.0;
+        row[3] = 9.0;
+        row[7] = 8.0;
+        row[1] = 1.0;
+        let tl = openinfer_sample::token_logprob_from_row(&row, 0, 3).expect("tl");
+        let ids: Vec<u32> = tl.top_logprobs.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![5, 3, 7], "top-3 draft ids by descending logit");
+        for w in tl.top_logprobs.windows(2) {
+            assert!(w[0].1 >= w[1].1, "top-k logprobs must be descending");
+        }
+        for (draft_id, _) in &tl.top_logprobs {
+            let t = drafter
+                .draft_to_target_id(*draft_id as usize)
+                .expect("d2t maps");
+            assert_eq!(t as i64, *draft_id as i64 + drafter.d2t[*draft_id as usize]);
+        }
+    }
+
+    /// (c) A width-N frontier of mutually independent nodes (each attends only the
+    /// committed prefix + its own KV slot) must match N separate single-node forwards
+    /// — proving no cross-node attention leakage. Also checks that widening the mask
+    /// so nodes see each other actually changes results (the mask is respected).
+    #[test]
+    #[ignore = "requires GPU + Qwen3-4B target and EAGLE-3 drafter weights"]
+    fn eagle3_frontier_independent_matches_sequential() {
+        let Some((target, drafter)) = load_or_skip() else {
+            return;
+        };
+        let ctx = target.device_ctx();
+        let feat_dim = drafter.fc_input_dim();
+        let hidden = drafter.config.hidden_size;
+
+        let prefix: Vec<u32> = vec![3, 5, 7];
+        let c = prefix.len();
+        let feat_host: Vec<half::bf16> = (0..feat_dim * c)
+            .map(|i| half::bf16::from_f32(((i % 11) as f32 - 5.0) * 0.02))
+            .collect();
+        let features = HiddenStates::from_host(ctx, &feat_host, feat_dim, c).expect("features");
+
+        let nn = 3usize;
+        let tokens: Vec<u32> = vec![100, 200, 300];
+        let ih_host: Vec<half::bf16> = (0..hidden * nn)
+            .map(|i| half::bf16::from_f32((((i * 7) % 19) as f32 - 9.0) * 0.01))
+            .collect();
+        let input_hidden =
+            HiddenStates::from_host(ctx, &ih_host, hidden, nn).expect("input hidden");
+        let top_k = 4usize;
+        let kv_len = c + nn;
+
+        // Batched, identity mask: node i attends prefix [0,c) + its own slot c+i.
+        let mut state_b = drafter.new_request_state(ctx, 64).expect("sb");
+        drafter
+            .prefill_batched(&target, &mut state_b, &features, &prefix, 0)
+            .expect("prefill b");
+        let mask_id = packed_mask_d(ctx, nn, kv_len, |i, j| j < c || j == c + i);
+        let out_b = drafter
+            .draft_frontier_topk(
+                &target,
+                &mut state_b,
+                &tokens,
+                &input_hidden,
+                c,
+                c,
+                kv_len,
+                &mask_id,
+                top_k,
+            )
+            .expect("batched frontier");
+
+        // Reference: N independent single-node forwards, each at position c writing
+        // slot c and attending [0,c+1).
+        for i in 0..nn {
+            let mut state_r = drafter.new_request_state(ctx, 64).expect("sr");
+            drafter
+                .prefill_batched(&target, &mut state_r, &features, &prefix, 0)
+                .expect("prefill r");
+            let mut ih_col = HiddenStates::zeros(ctx, hidden, 1).expect("ih col");
+            ops::copy_hidden_token_range_into(ctx, &input_hidden, i, &mut ih_col, 0, 1)
+                .expect("col");
+            let mask_r = packed_mask_d(ctx, 1, c + 1, |_i, _j| true);
+            let out_r = drafter
+                .draft_frontier_topk(
+                    &target,
+                    &mut state_r,
+                    &[tokens[i]],
+                    &ih_col,
+                    c,
+                    c,
+                    c + 1,
+                    &mask_r,
+                    top_k,
+                )
+                .expect("ref frontier");
+            let ids_b: Vec<u32> = out_b.per_node[i].iter().map(|(t, _)| *t).collect();
+            let ids_r: Vec<u32> = out_r.per_node[0].iter().map(|(t, _)| *t).collect();
+            assert_eq!(
+                ids_b, ids_r,
+                "node {i}: batched frontier top-k must match the independent single forward"
+            );
+        }
+
+        // Mask-respected guard: with a full [N,kv_len] mask (nodes also see siblings),
+        // at least one node's top-k should differ from the identity-mask result.
+        let mut state_f = drafter.new_request_state(ctx, 64).expect("sf");
+        drafter
+            .prefill_batched(&target, &mut state_f, &features, &prefix, 0)
+            .expect("prefill f");
+        let mask_full = packed_mask_d(ctx, nn, kv_len, |_i, _j| true);
+        let out_f = drafter
+            .draft_frontier_topk(
+                &target,
+                &mut state_f,
+                &tokens,
+                &input_hidden,
+                c,
+                c,
+                kv_len,
+                &mask_full,
+                top_k,
+            )
+            .expect("full-mask frontier");
+        let any_diff = (0..nn).any(|i| {
+            let a: Vec<u32> = out_b.per_node[i].iter().map(|(t, _)| *t).collect();
+            let b: Vec<u32> = out_f.per_node[i].iter().map(|(t, _)| *t).collect();
+            a != b
+        });
+        assert!(
+            any_diff,
+            "widening the mask so nodes attend siblings changed nothing — mask is being ignored"
         );
     }
 }

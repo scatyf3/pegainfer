@@ -835,6 +835,72 @@ pub fn eagle3_rope_into(
     Ok(())
 }
 
+/// EAGLE-3 RoPE with per-token positions from a device array — the tree/beam draft
+/// variant of [`eagle3_rope_into`]. Instead of `q_start_pos + token_index`, token
+/// `t`'s absolute position is `positions_d[t]` (q and k at a token share it), so a
+/// whole same-tree-depth frontier — all N nodes at ONE position — rotates in one
+/// launch. `positions_d` must hold at least `max(q_seq_len, k.seq_len)` entries.
+/// Bit-identical to [`eagle3_rope_into`] when `positions_d[t] == start_pos + t`.
+#[allow(clippy::too_many_arguments)]
+pub fn eagle3_rope_positions_into(
+    ctx: &DeviceContext,
+    q: &mut HiddenStates,
+    q_row_offset: usize,
+    q_seq_len: usize,
+    k: &mut HiddenStates,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    positions_d: &CudaSlice<i32>,
+) -> Result<()> {
+    assert_eq!(q.hidden_dim, num_q_heads * head_dim);
+    assert_eq!(k.hidden_dim, num_kv_heads * head_dim);
+    assert!(
+        q_row_offset + q_seq_len <= q.seq_len,
+        "eagle3_rope q row range [{}..{}) exceeds seq_len {}",
+        q_row_offset,
+        q_row_offset + q_seq_len,
+        q.seq_len
+    );
+    assert!(
+        positions_d.len() >= q_seq_len.max(k.seq_len),
+        "eagle3_rope positions array has {} entries, need >= max(q_seq_len {}, k_seq_len {})",
+        positions_d.len(),
+        q_seq_len,
+        k.seq_len
+    );
+
+    let (q_ptr, _gq) = q.data.device_ptr_mut(&ctx.stream);
+    let q_ptr = q_ptr + (q_row_offset * q.hidden_dim * std::mem::size_of::<bf16>()) as u64;
+    let (k_ptr, _gk) = k.data.device_ptr_mut(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+    let (pos_ptr, _gp) = positions_d.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::eagle3_rope_positions_cuda(
+            q_ptr as *mut ffi::Half,
+            k_ptr as *mut ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            pos_ptr as *const i32,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            q_seq_len as i32,
+            k.seq_len as i32,
+            (cos_cache.data.len() / head_dim) as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!("eagle3_rope_positions_cuda failed with error {result}");
+    }
+    Ok(())
+}
+
 /// Non-causal prefill attention for one DFlash request's draft block.
 ///
 /// `q` and `output` share the SAME row sub-range of batched buffers: request
