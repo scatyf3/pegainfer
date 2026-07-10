@@ -6,9 +6,11 @@ use anyhow::Result;
 use crate::config::Eagle3Config;
 use openinfer_core::tensor::{DeviceMatrix, DeviceVec};
 
+mod forward;
 mod loading;
 mod reservation;
 
+pub(crate) use forward::{Eagle3RequestState, Eagle3Scratch};
 pub(crate) use reservation::Eagle3MemoryReservation;
 
 /// Number of tokens the EAGLE-3 chain drafts per speculative round (γ; the verify
