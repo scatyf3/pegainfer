@@ -96,6 +96,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | Path | TL;DR |
 | --- | --- |
 | `subsystems/frontend/simulated-inference-engine.md` | CPU-only simulated model crate for vLLM/OpenAI frontend and `vllm bench serve` validation without CUDA, real model weights, or real-model performance claims. |
+| `subsystems/frontend/toolcall-error-rate.md` | Tool-call constrained-decoding A/B (issue #655): `scripts/toolcall_trace.py` drives vLLM/SGLang `/v1/chat/completions` with `tools`, buckets each response, reports accuracy + throughput at `--constrained off` vs `required`; `scripts/bfcl_to_scenarios.py` ingests BFCL. First warm Qwen3-0.6B result: constraint buys accuracy (83→99%) for ~35% lower req/s — throughput cost is real. Includes the warmup/run-order lesson (an un-warmed run inverted the result via cold-start). |
 
 ## subsystems / correctness
 
