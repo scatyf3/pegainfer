@@ -1,0 +1,165 @@
+{
+  "dataset": "bfcl_data/scenarios/simple_python.jsonl",
+  "n": 400,
+  "concurrency": 1,
+  "conditions": [
+    {
+      "cond": "off",
+      "ok": 400,
+      "failed": 0,
+      "wall_s": 42.24,
+      "req_s": 9.47,
+      "tok_s": 358.8,
+      "client": {
+        "ttft_ms": {
+          "p50": 38.34,
+          "p95": 47.32
+        },
+        "itl_ms": {
+          "p50": 2.4,
+          "p95": 6.06
+        },
+        "tpot_ms_usage": 1.63,
+        "tpot_ms_chunk": 3.0,
+        "tok_per_chunk": 1.85
+      },
+      "server": {
+        "vllm:time_to_first_token_seconds": {
+          "mean_ms": 13.28,
+          "n": 400,
+          "p50_ms": 15.03,
+          "p95_ms": 19.57,
+          "pct_unusable": false,
+          "lowest_bucket_s": 0.001
+        },
+        "vllm:request_time_per_output_token_seconds": {
+          "mean_ms": 2.44,
+          "n": 400,
+          "p50_ms": 5.0,
+          "p95_ms": 9.5,
+          "pct_unusable": true,
+          "lowest_bucket_s": 0.01
+        },
+        "vllm:inter_token_latency_seconds": {
+          "mean_ms": 2.447,
+          "n": 14759,
+          "p50_ms": 5.0,
+          "p95_ms": 9.5,
+          "pct_unusable": true,
+          "lowest_bucket_s": 0.01
+        },
+        "vllm:e2e_request_latency_seconds": {
+          "mean_ms": 103.492,
+          "n": 400,
+          "p50_ms": 150.38,
+          "p95_ms": 285.71,
+          "pct_unusable": true,
+          "lowest_bucket_s": 0.3
+        },
+        "vllm:request_queue_time_seconds": {
+          "mean_ms": 0.012,
+          "n": 400,
+          "p50_ms": 150.0,
+          "p95_ms": 285.0,
+          "pct_unusable": true,
+          "lowest_bucket_s": 0.3
+        },
+        "vllm:request_prefill_time_seconds": {
+          "mean_ms": 7.909,
+          "n": 400,
+          "p50_ms": 150.0,
+          "p95_ms": 285.0,
+          "pct_unusable": true,
+          "lowest_bucket_s": 0.3
+        },
+        "vllm:request_inference_time_seconds": {
+          "mean_ms": 98.216,
+          "n": 400,
+          "p50_ms": 150.38,
+          "p95_ms": 285.71,
+          "pct_unusable": true,
+          "lowest_bucket_s": 0.3
+        }
+      }
+    },
+    {
+      "cond": "required",
+      "ok": 400,
+      "failed": 0,
+      "wall_s": 52.55,
+      "req_s": 7.61,
+      "tok_s": 338.8,
+      "client": {
+        "ttft_ms": {
+          "p50": 56.65,
+          "p95": 70.06
+        },
+        "itl_ms": {
+          "p50": 2.45,
+          "p95": 4.03
+        },
+        "tpot_ms_usage": 1.52,
+        "tpot_ms_chunk": 2.65,
+        "tok_per_chunk": 1.768
+      },
+      "server": {
+        "vllm:time_to_first_token_seconds": {
+          "mean_ms": 14.956,
+          "n": 400,
+          "p50_ms": 15.32,
+          "p95_ms": 24.0,
+          "pct_unusable": false,
+          "lowest_bucket_s": 0.001
+        },
+        "vllm:request_time_per_output_token_seconds": {
+          "mean_ms": 2.628,
+          "n": 400,
+          "p50_ms": 5.0,
+          "p95_ms": 9.5,
+          "pct_unusable": true,
+          "lowest_bucket_s": 0.01
+        },
+        "vllm:inter_token_latency_seconds": {
+          "mean_ms": 2.632,
+          "n": 17403,
+          "p50_ms": 5.0,
+          "p95_ms": 9.5,
+          "pct_unusable": true,
+          "lowest_bucket_s": 0.01
+        },
+        "vllm:e2e_request_latency_seconds": {
+          "mean_ms": 129.211,
+          "n": 400,
+          "p50_ms": 150.38,
+          "p95_ms": 285.71,
+          "pct_unusable": true,
+          "lowest_bucket_s": 0.3
+        },
+        "vllm:request_queue_time_seconds": {
+          "mean_ms": 0.043,
+          "n": 400,
+          "p50_ms": 150.0,
+          "p95_ms": 285.0,
+          "pct_unusable": true,
+          "lowest_bucket_s": 0.3
+        },
+        "vllm:request_prefill_time_seconds": {
+          "mean_ms": 8.309,
+          "n": 400,
+          "p50_ms": 150.0,
+          "p95_ms": 285.0,
+          "pct_unusable": true,
+          "lowest_bucket_s": 0.3
+        },
+        "vllm:request_inference_time_seconds": {
+          "mean_ms": 122.818,
+          "n": 400,
+          "p50_ms": 150.0,
+          "p95_ms": 285.0,
+          "pct_unusable": true,
+          "lowest_bucket_s": 0.3
+        }
+      }
+    }
+  ]
+}
