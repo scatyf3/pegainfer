@@ -36,8 +36,13 @@
 #                    covers `sharegpt` and `synthetic` only.
 #   BENCH            vllm-bench binary [default: vllm-bench on PATH]
 #
+#   PROMPT_FILE      ShareGPT-style JSON. Required by the sharegpt dataset on
+#                    BOTH backends — sonnet and speed-bench ship their corpora,
+#                    sharegpt does not.
+#   SPEED_BENCH_CATEGORY  vllm-bench speed-bench split [default: coding, the
+#                    prior study's "code" row]
+#
 # http-backend only:
-#   PROMPT_FILE      ShareGPT-style JSON; required for the sharegpt dataset
 #   PROMPT_COUNT     prompts sampled from it [default: 30, the documented protocol]
 #   PROMPT_SEED      sampling seed [default: 512, the documented protocol]
 #   PROMPT_WORDS     synthetic prompt length [default: 512]
@@ -67,6 +72,7 @@ PROMPT_FILE=${PROMPT_FILE:-}
 PROMPT_COUNT=${PROMPT_COUNT:-30}
 PROMPT_SEED=${PROMPT_SEED:-512}
 PROMPT_WORDS=${PROMPT_WORDS:-512}
+SPEED_BENCH_CATEGORY=${SPEED_BENCH_CATEGORY:-coding}
 WARMUP=${WARMUP:-0}
 ACCEPT_LOG_CHECK=${ACCEPT_LOG_CHECK:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
@@ -75,7 +81,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 METRICS_TOOL="$SCRIPT_DIR/spec_accept_metrics.py"
 HTTP_BENCH="$REPO_ROOT/scripts/bench_http_serving.py"
-METRICS_URL="http://localhost:$PORT/metrics"
+METRICS_URL="http://127.0.0.1:$PORT/metrics"
 SERVER_LOG="$RESULT_DIR/server-${CONFIG}.log"
 
 if [[ "$BENCH_BACKEND" == "auto" ]]; then
@@ -95,6 +101,13 @@ case "$BENCH_BACKEND" in
       echo "       Use BENCH_BACKEND=http for the in-repo Python harness." >&2
       exit 1
     }
+    # sonnet and speed-bench carry their own corpora; sharegpt needs a file.
+    if [[ " $DATASETS " == *" sharegpt "* ]]; then
+      [[ -r "${PROMPT_FILE:-}" ]] || {
+        echo "FATAL: dataset 'sharegpt' needs PROMPT_FILE (a ShareGPT-style JSON)." >&2
+        exit 1
+      }
+    fi
     ;;
   http)
     DATASETS=${DATASETS:-"sharegpt"}
@@ -182,13 +195,13 @@ for _ in $(seq 1 "$READY_TIMEOUT"); do
     tail -40 "$SERVER_LOG" >&2
     exit 1
   fi
-  if curl -sf "http://localhost:$PORT/v1/models" > /dev/null 2>&1; then
+  if curl -sf "http://127.0.0.1:$PORT/v1/models" > /dev/null 2>&1; then
     echo "=== server ready ==="
     break
   fi
   sleep 1
 done
-if ! curl -sf "http://localhost:$PORT/v1/models" > /dev/null 2>&1; then
+if ! curl -sf "http://127.0.0.1:$PORT/v1/models" > /dev/null 2>&1; then
   echo "FATAL: server not ready after ${READY_TIMEOUT}s. Log:" >&2
   tail -40 "$SERVER_LOG" >&2
   exit 1
@@ -204,9 +217,16 @@ for DATASET in $DATASETS; do
   DATASET_ARGS=()
   if [[ "$BENCH_BACKEND" == "vllm-bench" ]]; then
     DATASET_ARGS=(--dataset-name "$DATASET")
-    if [[ "$DATASET" == "random" ]]; then
-      DATASET_ARGS+=(--random-input-len "$INPUT_LEN" --random-output-len "$OUTPUT_LEN")
-    fi
+    case "$DATASET" in
+      random)
+        DATASET_ARGS+=(--random-input-len "$INPUT_LEN" --random-output-len "$OUTPUT_LEN") ;;
+      sharegpt)
+        # sonnet and speed-bench ship their corpora; sharegpt does not.
+        DATASET_ARGS+=(--dataset-path "$PROMPT_FILE") ;;
+      speed-bench)
+        # The prior study's "code" row is the coding split specifically.
+        DATASET_ARGS+=(--speed-bench-category "$SPEED_BENCH_CATEGORY") ;;
+    esac
   elif [[ "$DATASET" == "sharegpt" ]]; then
     # The documented pool protocol: first human turn of each conversation,
     # length-filtered, then seed-sampled. Reproducible via PROMPT_SEED, not by
@@ -237,7 +257,7 @@ for DATASET in $DATASETS; do
     if [[ "$BENCH_BACKEND" == "vllm-bench" ]]; then
       "$BENCH" \
         --backend openai --model "$MODEL" --port "$PORT" \
-        --base-url "http://localhost:$PORT" \
+        --base-url "http://127.0.0.1:$PORT" \
         "${DATASET_ARGS[@]}" \
         --num-prompts "$NUM_PROMPTS" \
         --max-concurrency "$C" \
@@ -251,7 +271,7 @@ for DATASET in $DATASETS; do
       # WARMUP defaults to 0: warmup requests land between the two scrapes and
       # would otherwise be counted as measured rounds.
       python3 "$HTTP_BENCH" \
-        --base-url "http://localhost:$PORT" \
+        --base-url "http://127.0.0.1:$PORT" \
         --model "$MODEL" \
         "${DATASET_ARGS[@]}" \
         --num-requests "$NUM_PROMPTS" \
