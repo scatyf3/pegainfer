@@ -251,6 +251,84 @@ def report(cells: list[dict]) -> str:
     return "\n".join(out)
 
 
+ACCEPTED_DRAFT_RE = re.compile(r"accepted_draft=(\d+)")
+
+
+def verify_log(log_path: Path, cell_path: Path) -> int:
+    """Check the counters against the engine's own per-request accept trace.
+
+    `dflash_lane.rs` logs one `accepted_draft=N` line per request per verify
+    round. Aggregating those lines reconstructs the same three quantities the
+    counters carry, over the same server lifetime, by a completely independent
+    route: the log side is a plain print of `matched_draft_tokens`, while the
+    counter side travels through the fixed-width array, the `LoadSnapshot`
+    watch, cumulative-to-delta diffing in the bridge, msgpack over ZMQ, a
+    Prometheus counter, HTTP exposition, and CDF differencing back to a
+    histogram.
+
+    Comparing the *histogram* bin-by-bin is the part that matters. The rate
+    check (`accepted / drafted`) only exercises two scalars and would pass even
+    if the per-position vector were mis-plumbed or read as a histogram rather
+    than a complementary CDF.
+    """
+    stats = json.loads(cell_path.read_text())["stats"]
+    counts: dict[int, int] = {}
+    rounds = 0
+    accepted = 0
+    with log_path.open(errors="replace") as handle:
+        for line in handle:
+            match = ACCEPTED_DRAFT_RE.search(line)
+            if not match:
+                continue
+            value = int(match.group(1))
+            counts[value] = counts.get(value, 0) + 1
+            accepted += value
+            rounds += 1
+
+    if not rounds:
+        print(
+            f"WARN: no accepted_draft lines in {log_path} — the trace is "
+            "debug-level, so RUST_LOG must include openinfer_qwen3=debug. "
+            "Skipping the cross-check.",
+            file=sys.stderr,
+        )
+        return 0
+
+    log_hist = [counts.get(i, 0) for i in range(max(counts) + 1)]
+    # The counter histogram is K+1 wide by construction; the log only reaches the
+    # largest accept actually observed. Pad so a short tail is not a mismatch.
+    width = max(len(log_hist), len(stats["hist"]))
+    log_hist += [0] * (width - len(log_hist))
+    metrics_hist = list(stats["hist"]) + [0] * (width - len(stats["hist"]))
+
+    checks = [
+        ("rounds", rounds, stats["rounds"]),
+        ("accepted_tokens", accepted, stats["accepted_tokens"]),
+        ("histogram", log_hist, metrics_hist),
+    ]
+    failed = [name for name, a, b in checks if a != b]
+    for name, a, b in checks:
+        mark = "MISMATCH" if a != b else "MATCH"
+        if name == "histogram":
+            print(f"  {name:16} {mark}")
+            if a != b:
+                print(f"    log     {a}")
+                print(f"    metrics {b}")
+        else:
+            print(f"  {name:16} log {a:,} vs metrics {b:,}  {mark}")
+    print(f"  {'mean AL':16} log {accepted / rounds:.6f} vs "
+          f"metrics {stats['mean_accepted_draft']:.6f}")
+
+    if failed:
+        print(
+            "FATAL: the counters disagree with the engine's own trace on "
+            f"{', '.join(failed)}. Do not quote numbers from this run.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def selftest() -> int:
     """Round-trip the published DSpark/DFlash numbers through derive().
 
@@ -335,12 +413,23 @@ def main() -> int:
     p_report = sub.add_parser("report", help="case files -> markdown tables")
     p_report.add_argument("cells", nargs="+", type=Path)
 
+    p_verify = sub.add_parser(
+        "verify-log", help="counters vs the engine's own accept trace (issue #604)"
+    )
+    p_verify.add_argument("--log", required=True, type=Path, help="server log")
+    p_verify.add_argument(
+        "--cell", required=True, type=Path, help="stats file covering the same lifetime"
+    )
+
     sub.add_parser("selftest", help="validate derive() against published numbers")
 
     args = parser.parse_args()
 
     if args.cmd == "selftest":
         return selftest()
+
+    if args.cmd == "verify-log":
+        return verify_log(args.log, args.cell)
 
     if args.cmd == "snapshot":
         snap = scrape(args.url)

@@ -28,6 +28,9 @@
 #   INPUT_LEN        random-dataset input length [default: 1024]
 #   OUTPUT_LEN       output tokens per request [default: 128]
 #   SEED             base seed; each cell derives its own [default: 42]
+#   FIXED_SEED       if set, every cell uses exactly this seed instead of a
+#                    derived one. Cells then share a shuffle order (nested
+#                    draws). Use 0 to mimic a harness that never passed --seed.
 #   SECONDS_PER_RUN  prompts per cell = concurrency * this [default: 60]
 #   BENCH_BACKEND    vllm-bench | http | auto [default: auto]
 #                    `auto` picks vllm-bench when it is on PATH, else `http`.
@@ -65,6 +68,7 @@ CONCURRENCY_LIST=${CONCURRENCY_LIST:-"1 4 8"}
 INPUT_LEN=${INPUT_LEN:-1024}
 OUTPUT_LEN=${OUTPUT_LEN:-128}
 SEED=${SEED:-42}
+FIXED_SEED=${FIXED_SEED:-}
 SECONDS_PER_RUN=${SECONDS_PER_RUN:-60}
 BENCH=${BENCH:-vllm-bench}
 BENCH_BACKEND=${BENCH_BACKEND:-auto}
@@ -241,9 +245,18 @@ for DATASET in $DATASETS; do
   fi
   for C in $CONCURRENCY_LIST; do
     NUM_PROMPTS=$(python3 -c "print(int($C * $SECONDS_PER_RUN))")
-    # Derive from axis+value, not draw order, so a cell replays the same
-    # prompts regardless of which datasets are enabled.
-    POINT_SEED=$(( SEED + $(printf '%s' "$DATASET=$C" | cksum | cut -d' ' -f1) % 100000 ))
+    if [[ -n "$FIXED_SEED" ]]; then
+      # One seed for every cell, which is what a harness that never passes
+      # --seed produces (vllm-bench defaults to 0). Cells then share a shuffle
+      # order, so a larger cell's prompts are a superset of a smaller one's —
+      # nested draws, not independent ones. Needed to line up with a study that
+      # did not record its seed.
+      POINT_SEED=$FIXED_SEED
+    else
+      # Derive from axis+value, not draw order, so a cell replays the same
+      # prompts regardless of which datasets are enabled.
+      POINT_SEED=$(( SEED + $(printf '%s' "$DATASET=$C" | cksum | cut -d' ' -f1) % 100000 ))
+    fi
     TAG="${CONFIG}-${DATASET}-c${C}"
     echo ""
     echo "--- $TAG num_prompts=$NUM_PROMPTS seed=$POINT_SEED ---"
@@ -304,31 +317,16 @@ done
 
 if [[ "$ACCEPT_LOG_CHECK" == "1" ]]; then
   echo ""
-  echo "=== cross-check: /metrics vs dflash_lane.rs cumulative_accept_rate ==="
-  # Both sides count the same matched_draft_tokens over the same server
-  # lifetime, so they must agree to log-rounding (the trace prints 3 decimals),
-  # not merely be close. Drift means the counter plumbing lost or double-counted
-  # something. This is issue #604's acceptance criterion.
-  LOG_RATE=$(grep -o 'cumulative_accept_rate=[0-9.]*' "$SERVER_LOG" | tail -1 | cut -d= -f2 || true)
-  METRICS_RATE=$(python3 -c "
-import json,sys
-s=json.load(open('$RESULT_DIR/run-total-${CONFIG}.json'))['stats']
-print(f\"{s['accept_rate']:.3f}\")
-")
-  if [[ -z "$LOG_RATE" ]]; then
-    echo "WARN: no cumulative_accept_rate lines in $SERVER_LOG."
-    echo "      The trace is debug-level; RUST_LOG must include openinfer_qwen3=debug."
-  else
-    echo "  server log : $LOG_RATE"
-    echo "  /metrics   : $METRICS_RATE"
-    if [[ "$LOG_RATE" == "$METRICS_RATE" ]]; then
-      echo "  MATCH"
-    else
-      echo "  MISMATCH — the counters disagree with the engine's own tally." >&2
-      echo "  Investigate before quoting any number from this run." >&2
-      exit 1
-    fi
-  fi
+  echo "=== cross-check: /metrics counters vs dflash_lane.rs accept trace ==="
+  # Issue #604's acceptance criterion. Both sides tally the same
+  # matched_draft_tokens over the same server lifetime, by wholly independent
+  # routes, so they must agree exactly — not merely be close. The histogram is
+  # compared bin-by-bin, which is the only part that exercises the per-position
+  # vector and its CDF differencing; an accept-rate comparison alone would pass
+  # with that path broken.
+  "$METRICS_TOOL" verify-log \
+    --log "$SERVER_LOG" \
+    --cell "$RESULT_DIR/run-total-${CONFIG}.json"
 fi
 
 echo ""
