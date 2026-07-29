@@ -23,13 +23,26 @@
 #   GPU              CUDA device ordinal [default: 0]
 #   PORT             server port [default: 8000]
 #   RESULT_DIR       output directory [default: ./spec-accept-results]
-#   DATASETS         vllm-bench datasets [default: "sharegpt sonnet random speed-bench"]
+#   DATASETS         [default: depends on backend, see BENCH_BACKEND]
 #   CONCURRENCY_LIST [default: "1 4 8"]
 #   INPUT_LEN        random-dataset input length [default: 1024]
-#   OUTPUT_LEN       random-dataset output length [default: 128]
+#   OUTPUT_LEN       output tokens per request [default: 128]
 #   SEED             base seed; each cell derives its own [default: 42]
 #   SECONDS_PER_RUN  prompts per cell = concurrency * this [default: 60]
+#   BENCH_BACKEND    vllm-bench | http | auto [default: auto]
+#                    `auto` picks vllm-bench when it is on PATH, else `http`.
+#                    `http` uses scripts/bench_http_serving.py — stdlib only, no
+#                    install — but it has no sonnet/speed-bench datasets, so it
+#                    covers `sharegpt` and `synthetic` only.
 #   BENCH            vllm-bench binary [default: vllm-bench on PATH]
+#
+# http-backend only:
+#   PROMPT_FILE      ShareGPT-style JSON; required for the sharegpt dataset
+#   PROMPT_COUNT     prompts sampled from it [default: 30, the documented protocol]
+#   PROMPT_SEED      sampling seed [default: 512, the documented protocol]
+#   PROMPT_WORDS     synthetic prompt length [default: 512]
+#   WARMUP           warmup requests per cell [default: 0 — warmup lands inside
+#                    the scrape bracket and would be counted as measured rounds]
 #   ACCEPT_LOG_CHECK 1 = also run the engine at debug level and cross-check the
 #                    counters against dflash_lane.rs's cumulative_accept_rate
 #                    (issue #604's validation). Verbose: one line per request
@@ -43,23 +56,80 @@ CONFIG=${CONFIG:-$(basename "$DRAFT_MODEL")}
 GPU=${GPU:-0}
 PORT=${PORT:-8000}
 RESULT_DIR=${RESULT_DIR:-./spec-accept-results}
-DATASETS=${DATASETS:-"sharegpt sonnet random speed-bench"}
 CONCURRENCY_LIST=${CONCURRENCY_LIST:-"1 4 8"}
 INPUT_LEN=${INPUT_LEN:-1024}
 OUTPUT_LEN=${OUTPUT_LEN:-128}
 SEED=${SEED:-42}
 SECONDS_PER_RUN=${SECONDS_PER_RUN:-60}
 BENCH=${BENCH:-vllm-bench}
+BENCH_BACKEND=${BENCH_BACKEND:-auto}
+PROMPT_FILE=${PROMPT_FILE:-}
+PROMPT_COUNT=${PROMPT_COUNT:-30}
+PROMPT_SEED=${PROMPT_SEED:-512}
+PROMPT_WORDS=${PROMPT_WORDS:-512}
+WARMUP=${WARMUP:-0}
 ACCEPT_LOG_CHECK=${ACCEPT_LOG_CHECK:-1}
 SKIP_BUILD=${SKIP_BUILD:-0}
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 METRICS_TOOL="$SCRIPT_DIR/spec_accept_metrics.py"
+HTTP_BENCH="$REPO_ROOT/scripts/bench_http_serving.py"
 METRICS_URL="http://localhost:$PORT/metrics"
 SERVER_LOG="$RESULT_DIR/server-${CONFIG}.log"
 
+if [[ "$BENCH_BACKEND" == "auto" ]]; then
+  if command -v "$BENCH" > /dev/null 2>&1; then
+    BENCH_BACKEND=vllm-bench
+  else
+    BENCH_BACKEND=http
+    echo "note: $BENCH not on PATH — using the http backend ($HTTP_BENCH)"
+  fi
+fi
+
+case "$BENCH_BACKEND" in
+  vllm-bench)
+    DATASETS=${DATASETS:-"sharegpt sonnet random speed-bench"}
+    command -v "$BENCH" > /dev/null 2>&1 || {
+      echo "FATAL: BENCH_BACKEND=vllm-bench but '$BENCH' is not on PATH." >&2
+      echo "       Use BENCH_BACKEND=http for the in-repo Python harness." >&2
+      exit 1
+    }
+    ;;
+  http)
+    DATASETS=${DATASETS:-"sharegpt"}
+    [[ -x "$HTTP_BENCH" ]] || { echo "FATAL: $HTTP_BENCH not found" >&2; exit 1; }
+    for DATASET in $DATASETS; do
+      case "$DATASET" in
+        sharegpt)
+          [[ -n "$PROMPT_FILE" ]] || {
+            echo "FATAL: dataset 'sharegpt' on the http backend needs PROMPT_FILE" >&2
+            echo "       (a ShareGPT-style JSON of {conversations:[{from,value}]})." >&2
+            exit 1
+          }
+          [[ -r "$PROMPT_FILE" ]] || { echo "FATAL: cannot read PROMPT_FILE=$PROMPT_FILE" >&2; exit 1; }
+          ;;
+        synthetic) ;;
+        *)
+          # Better to stop than to silently swap in a different prompt
+          # distribution: the resulting accept numbers would be quoted against
+          # tables built from a dataset this backend never ran.
+          echo "FATAL: the http backend has no '$DATASET' dataset (it supports" >&2
+          echo "       sharegpt and synthetic). Install vllm-bench for sonnet /" >&2
+          echo "       speed-bench, or drop '$DATASET' from DATASETS." >&2
+          exit 1
+          ;;
+      esac
+    done
+    ;;
+  *)
+    echo "FATAL: BENCH_BACKEND must be vllm-bench, http, or auto (got '$BENCH_BACKEND')" >&2
+    exit 1
+    ;;
+esac
+
 mkdir -p "$RESULT_DIR"
+echo "=== bench backend: $BENCH_BACKEND | datasets: $DATASETS ==="
 
 # The derivation is pure arithmetic over the counters; validate it before
 # spending GPU time, so a reporting bug can't be mistaken for an engine bug.
@@ -131,9 +201,23 @@ fi
 
 CELLS=()
 for DATASET in $DATASETS; do
-  DATASET_ARGS=(--dataset-name "$DATASET")
-  if [[ "$DATASET" == "random" ]]; then
-    DATASET_ARGS+=(--random-input-len "$INPUT_LEN" --random-output-len "$OUTPUT_LEN")
+  DATASET_ARGS=()
+  if [[ "$BENCH_BACKEND" == "vllm-bench" ]]; then
+    DATASET_ARGS=(--dataset-name "$DATASET")
+    if [[ "$DATASET" == "random" ]]; then
+      DATASET_ARGS+=(--random-input-len "$INPUT_LEN" --random-output-len "$OUTPUT_LEN")
+    fi
+  elif [[ "$DATASET" == "sharegpt" ]]; then
+    # The documented pool protocol: first human turn of each conversation,
+    # length-filtered, then seed-sampled. Reproducible via PROMPT_SEED, not by
+    # taking a prefix — ShareGPT's own order is not random.
+    DATASET_ARGS=(--prompt-file "$PROMPT_FILE"
+                  --prompt-count "$PROMPT_COUNT"
+                  --prompt-seed "$PROMPT_SEED")
+  else
+    # Synthetic prompts draft too well and overstate acceptance; useful as a
+    # stress case, not as a number to quote (scripts/bench_http_serving.py).
+    DATASET_ARGS=(--prompt-words "$PROMPT_WORDS")
   fi
   for C in $CONCURRENCY_LIST; do
     NUM_PROMPTS=$(python3 -c "print(int($C * $SECONDS_PER_RUN))")
@@ -150,18 +234,33 @@ for DATASET in $DATASETS; do
     # --temperature 0 is load-bearing, not a default: should_speculative_decode
     # is all-or-nothing, so one non-greedy request drops the whole batch to
     # plain decode and every counter stays flat.
-    "$BENCH" \
-      --backend openai --model "$MODEL" --port "$PORT" \
-      --base-url "http://localhost:$PORT" \
-      "${DATASET_ARGS[@]}" \
-      --num-prompts "$NUM_PROMPTS" \
-      --max-concurrency "$C" \
-      --seed "$POINT_SEED" \
-      --ignore-eos --temperature 0 \
-      --tokenizer "$MODEL" \
-      --percentile-metrics ttft,tpot,itl,e2el \
-      --save-result --result-dir "$RESULT_DIR" \
-      --result-filename "bench-${TAG}.json"
+    if [[ "$BENCH_BACKEND" == "vllm-bench" ]]; then
+      "$BENCH" \
+        --backend openai --model "$MODEL" --port "$PORT" \
+        --base-url "http://localhost:$PORT" \
+        "${DATASET_ARGS[@]}" \
+        --num-prompts "$NUM_PROMPTS" \
+        --max-concurrency "$C" \
+        --seed "$POINT_SEED" \
+        --ignore-eos --temperature 0 \
+        --tokenizer "$MODEL" \
+        --percentile-metrics ttft,tpot,itl,e2el \
+        --save-result --result-dir "$RESULT_DIR" \
+        --result-filename "bench-${TAG}.json"
+    else
+      # WARMUP defaults to 0: warmup requests land between the two scrapes and
+      # would otherwise be counted as measured rounds.
+      python3 "$HTTP_BENCH" \
+        --base-url "http://localhost:$PORT" \
+        --model "$MODEL" \
+        "${DATASET_ARGS[@]}" \
+        --num-requests "$NUM_PROMPTS" \
+        --concurrency "$C" \
+        --warmup "$WARMUP" \
+        --max-tokens "$OUTPUT_LEN" \
+        --temperature 0 --ignore-eos \
+        --out "$RESULT_DIR/bench-${TAG}.json"
+    fi
 
     "$METRICS_TOOL" snapshot --url "$METRICS_URL" \
       --out "$RESULT_DIR/after-${TAG}.json"
