@@ -1716,12 +1716,16 @@ impl Qwen3Executor {
             "speculative decoding is not supported together with KV offload"
         );
         let meta = self.primary.load_dflash(draft_path.to_string())?;
+        // Before any executor state moves: a `K` the acceptance counters cannot
+        // describe fails the load outright rather than serving with a metric
+        // that quietly reports a narrower drafter than the one running.
+        let counters = SpecDecodeCounters::new(meta.num_spec_tokens)?;
         log::info!(
             "Qwen3 DFlash speculative decoding enabled: draft block size {}",
             meta.block_size
         );
         self.set_prefix_cache_enabled(false);
-        self.spec_decode_counters = Some(SpecDecodeCounters::new(meta.num_spec_tokens));
+        self.spec_decode_counters = Some(counters);
         self.speculative = Some(meta);
         Ok(())
     }
