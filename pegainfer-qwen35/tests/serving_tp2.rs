@@ -38,18 +38,13 @@ impl Qwen35Tp2Server {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires two CUDA devices, CUDA-12 NCCL, Qwen3.5 weights, and real HTTP frontend startup"]
 async fn qwen35_tp2_serves_openai_completions_over_http() -> Result<()> {
-    let Some(engine_model_path) =
-        common::model_path_or_skip("qwen35_tp2_serves_openai_completions_over_http")
-    else {
-        return Ok(());
-    };
-    let engine_model_path = PathBuf::from(engine_model_path);
-    let Some(frontend_model_path) = common::model_fixture::frontend_model_path_or_skip(
+    let engine_model_path = PathBuf::from(common::require_model_path(
+        "qwen35_tp2_serves_openai_completions_over_http",
+    ));
+    let frontend_model_path = common::model_fixture::require_frontend_model_path(
         &engine_model_path,
         "qwen35_tp2_serves_openai_completions_over_http",
-    ) else {
-        return Ok(());
-    };
+    );
     let frontend_model_path = PathBuf::from(frontend_model_path);
     let invalid_graph_model_path = engine_model_path.clone();
     let server = spawn_ready_server(engine_model_path, frontend_model_path, 1).await?;

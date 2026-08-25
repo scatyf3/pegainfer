@@ -12,6 +12,8 @@ use vllm_text::tokenizer::TiktokenTokenizer;
 pub(crate) mod model_fixture;
 
 pub(crate) use model_fixture::model_path_or_skip;
+#[allow(unused_imports)]
+pub(crate) use model_fixture::require_model_path;
 
 #[allow(dead_code)]
 pub(crate) fn load_tokenizer(model_path: &str) -> DynTokenizer {

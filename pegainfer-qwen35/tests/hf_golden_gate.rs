@@ -177,6 +177,26 @@ fn require_metadata<'a>(metadata: &'a HashMap<String, String>, key: &str) -> &'a
 }
 
 fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
+    match try_check_fixture_metadata(model_path, golden) {
+        Ok(()) => true,
+        Err(reason) => {
+            eprintln!("skipping qwen35 hf_golden_gate: {reason}");
+            false
+        }
+    }
+}
+
+/// `check_fixture_metadata` for explicitly selected gates: an unknown local
+/// revision is a failure, not a skip.
+fn require_fixture_metadata(test_name: &str, model_path: &str, golden: &Golden) {
+    if let Err(reason) = try_check_fixture_metadata(model_path, golden) {
+        panic!(
+            "{test_name} was selected explicitly but its fixture metadata is unusable: {reason}"
+        );
+    }
+}
+
+fn try_check_fixture_metadata(model_path: &str, golden: &Golden) -> Result<(), String> {
     let metadata = &golden.metadata;
     assert_eq!(
         require_metadata(metadata, "dtype"),
@@ -208,10 +228,10 @@ fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
         "qwen35 hf_golden_gate fixture must record a pinned model_revision"
     );
     let Some(actual_revision) = model_revision(model_path) else {
-        eprintln!(
-            "skipping qwen35 hf_golden_gate: fixture requires model_revision={expected_revision}, but local model revision is unknown"
-        );
-        return false;
+        return Err(format!(
+            "fixture requires model_revision={expected_revision}, but the local model \
+             revision is unknown; set PEGAINFER_TEST_MODEL_REVISION"
+        ));
     };
     assert_eq!(
         actual_revision, expected_revision,
@@ -224,7 +244,7 @@ fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
             "qwen35 hf_golden_gate fixture must record a pinned tokenizer_revision"
         );
     }
-    true
+    Ok(())
 }
 
 fn as_i32(st: &SafeTensors, name: &str) -> (Vec<i32>, Vec<usize>) {
@@ -321,6 +341,25 @@ impl Golden {
     /// An explicitly set env override must exist; a missing default keyed
     /// fixture is a clean skip (`None`).
     fn load_for(model_path: &str, long: bool) -> Option<Golden> {
+        match Self::try_load_for(model_path, long) {
+            Ok(golden) => Some(golden),
+            Err(reason) => {
+                eprintln!("skipping qwen35 hf_golden_gate: {reason}");
+                None
+            }
+        }
+    }
+
+    /// `load_for` for explicitly selected gates: a missing golden is a failure.
+    fn require_for(test_name: &str, model_path: &str, long: bool) -> Golden {
+        Self::try_load_for(model_path, long).unwrap_or_else(|reason| {
+            panic!(
+                "{test_name} was selected explicitly but its golden fixture is unusable: {reason}"
+            )
+        })
+    }
+
+    fn try_load_for(model_path: &str, long: bool) -> Result<Golden, String> {
         let env_key = if long { LONG_GOLDEN_ENV } else { GOLDEN_ENV };
         let Some(size) = fixture_size_name(model_path) else {
             assert!(
@@ -328,11 +367,10 @@ impl Golden {
                 "{env_key} is set but the model geometry in {model_path}/config.json \
                  has no entry in the size table"
             );
-            eprintln!(
-                "skipping qwen35 hf_golden_gate: unrecognized model geometry in \
-                 {model_path}/config.json; extend fixture_size_name to cover it"
-            );
-            return None;
+            return Err(format!(
+                "unrecognized model geometry in {model_path}/config.json; \
+                 extend fixture_size_name to cover it"
+            ));
         };
         let path = if let Ok(path) = std::env::var(env_key) {
             path
@@ -343,15 +381,14 @@ impl Golden {
                     !COMMITTED_FIXTURE_SIZES.contains(&size),
                     "committed golden fixture missing at {path}"
                 );
-                eprintln!(
-                    "skipping qwen35 hf_golden_gate: no golden fixture for this size at \
-                     {path}; generate one with tools/accuracy/dump_qwen35_hf_golden.py"
-                );
-                return None;
+                return Err(format!(
+                    "no golden fixture for this size at {path}; \
+                     generate one with tools/accuracy/dump_qwen35_hf_golden.py"
+                ));
             }
             path
         };
-        Some(Self::load_path(path))
+        Ok(Self::load_path(path))
     }
 
     fn load_path(path: impl AsRef<Path>) -> Golden {
@@ -837,15 +874,10 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
 #[test]
 #[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
 fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
-    let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden_tp2") else {
-        return;
-    };
-    let Some(golden) = Golden::load_for(&model_path, false) else {
-        return;
-    };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    const GATE: &str = "pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2";
+    let model_path = common::require_model_path(GATE);
+    let golden = Golden::require_for(GATE, &model_path, false);
+    require_fixture_metadata(GATE, &model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -866,16 +898,10 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
 #[test]
 #[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
 fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
-    let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_long_golden_tp2")
-    else {
-        return;
-    };
-    let Some(golden) = Golden::load_for(&model_path, true) else {
-        return;
-    };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    const GATE: &str = "pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2";
+    let model_path = common::require_model_path(GATE);
+    let golden = Golden::require_for(GATE, &model_path, true);
+    require_fixture_metadata(GATE, &model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 

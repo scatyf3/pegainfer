@@ -822,9 +822,7 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
 #[test]
 #[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
 fn test_e2e_qwen35_scheduler_tp2() {
-    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_scheduler_tp2") else {
-        return;
-    };
+    let model_path = common::require_model_path("test_e2e_qwen35_scheduler_tp2");
 
     info!("Loading Qwen3.5 TP2 model for scheduler test...");
     let start = Instant::now();

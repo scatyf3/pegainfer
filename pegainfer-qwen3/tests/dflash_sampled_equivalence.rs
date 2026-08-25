@@ -98,34 +98,52 @@ type ConfigTokens = Vec<Vec<Vec<u32>>>;
 /// Serialize engine-holding test bodies — one engine resident at a time.
 static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn target_path_or_skip() -> Option<String> {
-    match std::env::var("PEGAINFER_TEST_MODEL_PATH") {
-        Ok(path) => Some(path),
-        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
-            Some(MODEL_PATH.to_string())
-        }
-        Err(_) => {
-            eprintln!(
-                "skipping sampled-equivalence gate: {MODEL_PATH}/config.json missing; set PEGAINFER_TEST_MODEL_PATH"
-            );
-            None
-        }
-    }
+/// Every gate in this file is `#[ignore]`d, so the only way one runs is a
+/// maintainer naming it. A missing or invalid checkpoint is therefore a
+/// failure, not a skip: returning early would report success for a gate that
+/// never loaded a model.
+fn require_target_path(test_name: &str) -> String {
+    require_checkpoint(
+        test_name,
+        "PEGAINFER_TEST_MODEL_PATH",
+        MODEL_PATH,
+        "Qwen3-4B target",
+    )
 }
 
-fn draft_path_or_skip() -> Option<String> {
-    match std::env::var("PEGAINFER_DFLASH_TEST_MODEL_PATH") {
-        Ok(path) => Some(path),
-        Err(_) if Path::new(DRAFT_PATH).join("config.json").exists() => {
-            Some(DRAFT_PATH.to_string())
-        }
-        Err(_) => {
-            eprintln!(
-                "skipping sampled-equivalence gate: {DRAFT_PATH}/config.json missing; set PEGAINFER_DFLASH_TEST_MODEL_PATH"
-            );
-            None
-        }
+fn require_draft_path(test_name: &str) -> String {
+    require_checkpoint(
+        test_name,
+        "PEGAINFER_DFLASH_TEST_MODEL_PATH",
+        DRAFT_PATH,
+        "DFlash draft",
+    )
+}
+
+fn require_checkpoint(test_name: &str, env: &str, default_path: &str, role: &str) -> String {
+    let fail = |reason: String| -> ! {
+        panic!(
+            "{test_name} was selected explicitly but its {role} checkpoint is unusable: {reason}\n\
+             This gate is #[ignore]d, so it only runs when a maintainer names it; a missing \
+             checkpoint is a failure, not a skip."
+        )
+    };
+
+    let path = match std::env::var(env) {
+        Ok(path) if path.trim().is_empty() => fail(format!("{env} is empty")),
+        Ok(path) => path,
+        Err(std::env::VarError::NotUnicode(_)) => fail(format!("{env} is not valid UTF-8")),
+        Err(std::env::VarError::NotPresent) => default_path.to_string(),
+    };
+
+    let config = Path::new(&path).join("config.json");
+    if !config.is_file() {
+        fail(format!(
+            "{} is missing; point {env} at a {role} checkpoint",
+            config.display()
+        ));
     }
+    path
 }
 
 fn env_knob(name: &str, default: usize) -> usize {
@@ -425,9 +443,8 @@ fn dump_json(path: &str, arms: [(&str, &[ConfigTokens]); 2]) {
 #[ignore = "GPU equivalence gate — needs Qwen3-4B + DFlash weights and ~20 GiB VRAM headroom"]
 fn dflash_sampled_equivalence_gate() {
     let _gpu = GPU.lock().unwrap();
-    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
-        return;
-    };
+    let model_path = require_target_path("dflash_sampled_equivalence_gate");
+    let draft_path = require_draft_path("dflash_sampled_equivalence_gate");
     let runs = env_knob("PEGAINFER_EQ_RUNS", 256);
     let batch = env_knob("PEGAINFER_EQ_BATCH", 16);
 
@@ -477,9 +494,8 @@ fn dflash_sampled_equivalence_gate() {
 #[ignore = "GPU null check — needs Qwen3-4B + DFlash weights"]
 fn dflash_sampled_equivalence_null_check() {
     let _gpu = GPU.lock().unwrap();
-    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
-        return;
-    };
+    let model_path = require_target_path("dflash_sampled_equivalence_null_check");
+    let draft_path = require_draft_path("dflash_sampled_equivalence_null_check");
     let runs = env_knob("PEGAINFER_EQ_RUNS", 256);
     let batch = env_knob("PEGAINFER_EQ_BATCH", 16);
 
@@ -513,9 +529,8 @@ fn dflash_sampled_equivalence_null_check() {
 #[ignore = "GPU seeded-determinism gate — needs Qwen3-4B + DFlash weights"]
 fn dflash_sampled_seeded_determinism() {
     let _gpu = GPU.lock().unwrap();
-    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
-        return;
-    };
+    let model_path = require_target_path("dflash_sampled_seeded_determinism");
+    let draft_path = require_draft_path("dflash_sampled_seeded_determinism");
     let tokenizer = common::load_tokenizer(&model_path);
     let engine = EngineHarness::new(
         pegainfer_qwen3::launch(
