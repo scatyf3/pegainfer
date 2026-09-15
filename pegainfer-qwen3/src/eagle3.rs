@@ -1,5 +1,4 @@
 // EAGLE-3 drafter (e.g. `AngelSlim/Qwen3-4B_eagle3`).
-#![allow(dead_code)]
 
 use anyhow::Result;
 use pegainfer_core::tensor::DeviceMatrix;
@@ -11,19 +10,14 @@ mod forward;
 mod loading;
 mod reservation;
 
-// Consumed by the scheduler PR that drives the drafter; exported as the forward
-// path lands.
-#[allow(unused_imports)]
 pub(crate) use forward::Eagle3RequestState;
-#[allow(unused_imports)]
 pub(crate) use forward::Eagle3Scratch;
-// Wired into the KV budget by the scheduler PR; kept here as the skeleton lands.
-#[allow(unused_imports)]
 pub(crate) use reservation::Eagle3MemoryReservation;
 
 /// Number of tokens the EAGLE-3 chain drafts per speculative round (γ; the verify
 /// span is `EAGLE3_CHAIN_LENGTH + 1`: the current token plus γ drafts). v1 is a
-/// fixed top-1 **chain** — *not* a tree. γ=3 is the measured chain optimum on a Qwen3-4B GSM8K A/B (RTX 5070 Ti)
+/// fixed top-1 **chain** — *not* a tree. γ=3 is carried over from the pre-rebase
+/// prototype; the same-head A/B that should pin it is still open.
 pub(crate) const EAGLE3_CHAIN_LENGTH: usize = 3;
 
 /// The three *target* layers (low/mid/high) whose **post-layer** hidden states
@@ -90,7 +84,9 @@ pub(crate) struct Eagle3DraftModel {
     /// Length `draft_vocab_size`. Host-resident (small lookup, not a GEMM input).
     pub(crate) d2t: Vec<i64>,
     /// Target→draft presence mask: `t2d[target_id]` is true iff that target token
-    /// exists in the draft vocab. Length `vocab_size`.
+    /// exists in the draft vocab. Length `vocab_size`. Loaded and length-checked
+    /// with the checkpoint; the greedy chain never needs the reverse lookup.
+    #[allow(dead_code)]
     pub(crate) t2d: Vec<bool>,
     pub(crate) cos_cache: DeviceVec,
     pub(crate) sin_cache: DeviceVec,

@@ -92,6 +92,7 @@ pub(crate) fn start_qwen3(
     memory_options: Qwen3MemoryOptions,
     decode_overlap: crate::DecodeOverlap,
     dflash_draft_model_path: Option<&str>,
+    eagle3_draft_model_path: Option<&str>,
     dump_graph_png: Option<&Path>,
 ) -> Result<Engine> {
     let mut executor = Qwen3Executor::from_runtime_with_decode_environment(
@@ -102,6 +103,7 @@ pub(crate) fn start_qwen3(
         offload_options,
         max_prefill_tokens,
         dflash_draft_model_path,
+        eagle3_draft_model_path,
         memory_options,
         decode_overlap,
     )?;
@@ -124,6 +126,9 @@ pub(crate) fn start_qwen3(
     // was already reserved during profiling from the draft path passed above.
     if let Some(draft_path) = dflash_draft_model_path {
         executor.load_dflash_draft_model(draft_path)?;
+    }
+    if let Some(draft_path) = eagle3_draft_model_path {
+        executor.load_eagle3_draft_model(draft_path)?;
     }
 
     Ok(start_with_executor(

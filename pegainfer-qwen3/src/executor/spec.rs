@@ -22,7 +22,7 @@ impl Qwen3Executor {
         plan: VerifyPlan<'_>,
     ) -> Result<VerifyResult> {
         anyhow::ensure!(
-            self.speculative.is_some(),
+            self.drafter_loaded(),
             "speculative verification requested but no draft model is loaded"
         );
         for req in plan.requests {
@@ -32,8 +32,8 @@ impl Qwen3Executor {
                 req.request_id
             );
             anyhow::ensure!(
-                self.dflash_ready_requests.contains(&req.request_id),
-                "speculative verification requested before DFlash state is ready for {:?}",
+                self.draft_ready_requests.contains(&req.request_id),
+                "speculative verification requested before draft state is ready for {:?}",
                 req.request_id
             );
             anyhow::ensure!(
@@ -151,13 +151,13 @@ impl Qwen3Executor {
         plan: DraftPlan<'_>,
     ) -> Result<DraftResult> {
         anyhow::ensure!(
-            self.speculative.is_some(),
+            self.drafter_loaded(),
             "speculative draft requested but no draft model is loaded"
         );
         for req in plan.requests {
             anyhow::ensure!(
-                self.dflash_ready_requests.contains(&req.request_id),
-                "speculative draft requested before DFlash state is ready for {:?}",
+                self.draft_ready_requests.contains(&req.request_id),
+                "speculative draft requested before draft state is ready for {:?}",
                 req.request_id
             );
         }

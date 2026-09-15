@@ -105,6 +105,15 @@ struct Qwen3Cli {
     /// incompatible with `--kv-offload`, which keeps prefix matching on regardless.
     #[arg(long, default_value_t = false)]
     batch_invariant: bool,
+
+    /// EAGLE-3 speculative drafter model path (e.g. `AngelSlim/Qwen3-4B_eagle3`).
+    /// Speculates greedy requests whose prompt fits one prefill chunk; other
+    /// requests decode normally. Single-GPU only; incompatible with
+    /// --enable-lora, --kv-offload, --decode-overlap, --batch-invariant and
+    /// --dflash-draft-model-path, and forces the prefix cache off (it needs
+    /// clean target hidden states).
+    #[arg(long = "eagle3-draft-model-path")]
+    eagle3_draft_model_path: Option<std::path::PathBuf>,
 }
 
 fn resolve_decode_overlap(overlap: CliDecodeOverlap, decode_sm_pct: u32) -> DecodeOverlap {
@@ -220,6 +229,11 @@ impl ModelLine for Qwen3Line {
                     "--batch-invariant is not supported with DFlash speculative decoding; enable one at a time",
                 ));
             }
+            if cli.eagle3_draft_model_path.is_some() {
+                return Err(CliError::rule(
+                    "--batch-invariant is not supported with EAGLE-3 speculative decoding; enable one at a time",
+                ));
+            }
             if shared.tp_size > 1 {
                 return Err(CliError::rule(
                     "--batch-invariant is not supported with --tp-size > 1; enable one at a time",
@@ -246,6 +260,33 @@ impl ModelLine for Qwen3Line {
             if shared.tp_size != 1 {
                 return Err(CliError::rule(
                     "--dflash-draft-model-path currently requires --tp-size=1",
+                ));
+            }
+        }
+        if cli.eagle3_draft_model_path.is_some() {
+            if shared.dflash_draft_model_path.is_some() {
+                return Err(CliError::rule(
+                    "--eagle3-draft-model-path and --dflash-draft-model-path are mutually exclusive",
+                ));
+            }
+            if cli.enable_lora {
+                return Err(CliError::rule(
+                    "--eagle3-draft-model-path is not supported with --enable-lora",
+                ));
+            }
+            if shared.kv_offload {
+                return Err(CliError::rule(
+                    "--eagle3-draft-model-path is not supported with --kv-offload",
+                ));
+            }
+            if shared.tp_size != 1 {
+                return Err(CliError::rule(
+                    "--eagle3-draft-model-path currently requires --tp-size=1",
+                ));
+            }
+            if shared.decode_overlap != CliDecodeOverlap::Off {
+                return Err(CliError::rule(
+                    "--eagle3-draft-model-path is not supported with --decode-overlap",
                 ));
             }
         }
@@ -327,6 +368,7 @@ impl ModelLine for Qwen3Line {
                 decode_overlap: resolve_decode_overlap(shared.decode_overlap, shared.decode_sm_pct),
                 batch_invariant: cli.batch_invariant,
                 dflash_draft_model_path: shared.dflash_draft_model_path.clone(),
+                eagle3_draft_model_path: cli.eagle3_draft_model_path.clone(),
             },
         )
         .map(LaunchedEngine::Stepped)

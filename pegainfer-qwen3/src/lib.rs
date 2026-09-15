@@ -251,6 +251,9 @@ pub struct Qwen3LaunchOptions {
     /// `Some` enables DFlash speculative decoding with this drafter model.
     /// Single-GPU only and mutually exclusive with LoRA and KV offload.
     pub dflash_draft_model_path: Option<PathBuf>,
+    /// `Some` enables EAGLE-3 speculative decoding with this drafter model.
+    /// Same constraints as DFlash, and mutually exclusive with it.
+    pub eagle3_draft_model_path: Option<PathBuf>,
 }
 
 /// Start the Qwen3 engine from server-facing [`Qwen3LaunchOptions`].
@@ -316,6 +319,21 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<Engine> 
          (--decode-overlap): the speculative path never takes the unified overlap \
          route, so the overlap streams would only waste VRAM the drafter needs"
     );
+    anyhow::ensure!(
+        !(options.dflash_draft_model_path.is_some() && options.eagle3_draft_model_path.is_some()),
+        "DFlash and EAGLE-3 speculative decoding are mutually exclusive"
+    );
+    anyhow::ensure!(
+        !(options.eagle3_draft_model_path.is_some() && options.lora.is_some()),
+        "EAGLE-3 speculative decoding cannot be combined with LoRA serving"
+    );
+    anyhow::ensure!(
+        options.eagle3_draft_model_path.is_none()
+            || matches!(options.decode_overlap, DecodeOverlap::Off),
+        "EAGLE-3 speculative decoding cannot be combined with decode overlap \
+         (--decode-overlap): the speculative path never takes the unified overlap \
+         route, so the overlap streams would only waste VRAM the drafter needs"
+    );
     match options.lora {
         Some(lora) => {
             info!(
@@ -344,6 +362,7 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<Engine> 
             options.decode_overlap,
             options.batch_invariant,
             options.dflash_draft_model_path.as_deref(),
+            options.eagle3_draft_model_path.as_deref(),
             options.dump_graph_png.as_deref(),
         ),
     }
@@ -398,6 +417,7 @@ pub fn start_engine_with_offload(
         batch_invariant,
         dflash_draft_model_path,
         None,
+        None,
     )
 }
 
@@ -412,6 +432,7 @@ fn start_engine_with_offload_inner(
     decode_overlap: DecodeOverlap,
     batch_invariant: bool,
     dflash_draft_model_path: Option<&Path>,
+    eagle3_draft_model_path: Option<&Path>,
     dump_graph_png: Option<&Path>,
 ) -> Result<Engine> {
     let EngineLoadOptions {
@@ -429,6 +450,7 @@ fn start_engine_with_offload_inner(
             no_prefix_cache,
             offload_options.enabled,
             dflash_draft_model_path.is_some(),
+            eagle3_draft_model_path.is_some(),
             device_ordinals.len(),
         )?;
     }
@@ -437,6 +459,12 @@ fn start_engine_with_offload_inner(
         .map(|path| {
             path.to_str()
                 .ok_or_else(|| anyhow::anyhow!("DFlash draft model path must be valid UTF-8"))
+        })
+        .transpose()?;
+    let eagle3_draft_model_path = eagle3_draft_model_path
+        .map(|path| {
+            path.to_str()
+                .ok_or_else(|| anyhow::anyhow!("EAGLE-3 draft model path must be valid UTF-8"))
         })
         .transpose()?;
     frontend_adapter::start_qwen3(
@@ -450,6 +478,7 @@ fn start_engine_with_offload_inner(
         memory_options,
         decode_overlap,
         dflash_draft_model_path,
+        eagle3_draft_model_path,
         dump_graph_png,
     )
 }
@@ -516,6 +545,7 @@ fn ensure_batch_invariant_supported(
     no_prefix_cache: bool,
     offload: bool,
     dflash: bool,
+    eagle3: bool,
     world_size: usize,
 ) -> Result<()> {
     if !matches!(decode_overlap, DecodeOverlap::Off) {
@@ -540,6 +570,13 @@ fn ensure_batch_invariant_supported(
             "--batch-invariant is not supported with DFlash speculative decoding: the decode-GEMM \
              pin warms and self-checks only the base projections, so the drafter's fc/MLP GEMMs \
              are not pinned and would bail at the GEMM boundary under Pin"
+        );
+    }
+    if eagle3 {
+        anyhow::bail!(
+            "--batch-invariant is not supported with EAGLE-3 speculative decoding: the decode-GEMM \
+             pin warms and self-checks only the base projections, so the drafter's fc/qkv/MLP/lm_head \
+             GEMMs are not pinned and would bail at the GEMM boundary under Pin"
         );
     }
     if !no_prefix_cache {

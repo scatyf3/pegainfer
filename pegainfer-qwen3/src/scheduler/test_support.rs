@@ -195,7 +195,7 @@ impl ModelExecutor for FakeExecutor {
                 .iter()
                 .map(|req| self.fake_prefill_result(req))
                 .collect(),
-            dflash_context_captured_requests: Vec::new(),
+            draft_context_captured_requests: Vec::new(),
         })
     }
 
