@@ -16,9 +16,11 @@ pub(crate) use reservation::Eagle3MemoryReservation;
 
 /// Number of tokens the EAGLE-3 chain drafts per speculative round (γ; the verify
 /// span is `EAGLE3_CHAIN_LENGTH + 1`: the current token plus γ drafts). v1 is a
-/// fixed top-1 **chain** — *not* a tree. γ=3 is carried over from the pre-rebase
-/// prototype; the same-head A/B that should pin it is still open.
-pub(crate) const EAGLE3_CHAIN_LENGTH: usize = 3;
+/// fixed top-1 **chain** — *not* a tree. γ=3 is the single source of truth for
+/// every EAGLE-3 A/B: the GSM8K harness records it, and the vLLM comparison
+/// (`tools/bench/eagle3_vllm_ab.py`) reads it back as `num_speculative_tokens`,
+/// so the two engines always draft the same chain length.
+pub const EAGLE3_CHAIN_LENGTH: usize = 3;
 
 /// The three *target* layers (low/mid/high) whose **post-layer** hidden states
 /// EAGLE-3 captures and fuses via `fc`.

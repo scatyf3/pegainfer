@@ -85,6 +85,7 @@ impl Default for Qwen3LoraOptions {
 /// Prefill/decode GPU-sharing mode (`--decode-overlap`). Defined alongside the
 /// stream plumbing in [`green_ctx`].
 pub use green_ctx::DecodeOverlap;
+pub use eagle3::EAGLE3_CHAIN_LENGTH;
 
 /// KV-offload (pegaflow) opt-in for the single-GPU Qwen3 path.
 ///
